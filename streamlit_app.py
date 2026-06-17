@@ -989,9 +989,8 @@ def run_consistency_tests(mc_results: Dict, scenario_name: str) -> List[Dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Part 4: Economic Dominance Score ─────────────────────────────────────
 st.markdown("---")
-st.markdown("##### 📊  Economic Dominance Score")
+st.markdown("##### 📊 Economic Dominance Score")
 
-# Use the single-run engine if available; otherwise run seed 0
 engine = st.session_state.get("engine")
 
 if engine is None:
@@ -1015,17 +1014,33 @@ if dom["r2"] is not None:
         f"<div class='panel' style='text-align:center;padding:.7rem;'>"
         f"<div class='metric-label'>Economic Signal Strength</div>"
         f"<div class='metric-value'>{sig:.1f}%</div>"
-        f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div></div>",
-        unsafe_allow_html=True)
+        f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     col2.markdown(
         f"<div class='panel' style='text-align:center;padding:.7rem;'>"
         f"<div class='metric-label'>Noise Contribution</div>"
         f"<div class='metric-value'>{noise:.1f}%</div>"
-        f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div></div>",
-        unsafe_allow_html=True)
+        f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     r2_bars = dom.get("asset_r2", {})
+
+    col3.markdown(
+        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
+        f"<div class='metric-label'>Per-Asset R²</div>"
+        + "".join(
+            f"<div style='font-family:monospace;font-size:.85rem;margin-top:.2rem;'>"
+            f"{a}: {v*100:.1f}%</div>"
+            for a, v in r2_bars.items()
+        )
+        + "</div>",
+        unsafe_allow_html=True,
+    )
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 5: ROBUSTNESS / CONFIDENCE LEVEL
 # ══════════════════════════════════════════════════════════════════════════════
