@@ -284,9 +284,12 @@ class Asset:
         """
         noise = rng.gauss(0, self.base_volatility)
         pct_change = demand_pressure * self.sensitivity + noise
-        # Floor returns at -60% per period so the simulation cannot produce
-        # a literal zero or negative price, which would break log-style charts.
-        pct_change = max(pct_change, -0.6)
+        # Cap per-period moves at [-8%, +8%] — large enough to register a
+        # clear "crisis period" or "melt-up period" but small enough that
+        # even several consecutive extreme periods compound to a severe-but-
+        # plausible drawdown/rally rather than a mathematically degenerate
+        # price level over a 100-250 period run.
+        pct_change = max(min(pct_change, 8.0), -8.0)
         new_price = self.price * (1 + pct_change / 100.0)
         new_price = max(new_price, 0.01)
         self.price_history.append(new_price)
@@ -360,6 +363,26 @@ class Agent:
         lo, hi = self.allocation_bounds.get(asset_name, (-3.0, 3.0))
         return max(lo, min(hi, value))
 
+    def _move_toward(self, deltas: Dict[str, float], asset_name: str, target: float, speed: float):
+        """
+        Nudge `asset_name`'s allocation a fraction (`speed`) of the way from
+        its CURRENT level toward `target`, and record the resulting delta in
+        `deltas` (additively, so multiple rules touching the same asset in
+        one decide() call combine sensibly).
+
+        This is the key negative-feedback mechanism that keeps the
+        simulation well-behaved: a rule that fires every period a condition
+        holds (e.g. "sentiment stays bearish for 40 periods straight") does
+        NOT keep pushing allocation by a constant amount forever — the move
+        shrinks as the agent approaches its target and stops once it
+        arrives, exactly like a real allocator adjusting toward a desired
+        position rather than trading in one direction indefinitely.
+        """
+        current = self.current_allocation.get(asset_name, 0.0) + deltas.get(asset_name, 0.0)
+        delta = (target - current) * speed
+        deltas[asset_name] = deltas.get(asset_name, 0.0) + delta
+        return delta
+
     def apply_order(self, order: AgentOrder):
         """Apply the allocation deltas to produce this period's new allocation,
         clamped to this agent's realistic mandate bounds. Clamping is what
@@ -424,48 +447,56 @@ class PensionFund(Agent):
         super().__init__({"Stocks": 0.40, "Bonds": 0.50, "Gold": 0.10})
 
     def decide(self, env: MacroEnvironment, market: "Market", period: int) -> AgentOrder:
-        deltas = {"Stocks": 0.0, "Bonds": 0.0, "Gold": 0.0}
+        deltas: Dict[str, float] = {}
         rationale: List[str] = []
+        base_stocks, base_bonds, base_gold = 0.40, 0.50, 0.10
 
-        # Rule 1: inflation hedge via bonds... but only mild duration shift;
-        # pension funds move slowly and deliberately.
+        # Each rule below sets a TARGET allocation and moves a fraction of
+        # the way toward it each period (see Agent._move_toward). This
+        # means a persistent condition (e.g. inflation staying above 5% for
+        # 40 periods straight) pulls the portfolio toward, and then holds
+        # it at, a new equilibrium — rather than pushing it the same amount
+        # every single period forever, which would compound to nonsense.
+
+        # Rule 1: inflation hedge — target a higher bond / lower equity mix
         if env.is_high_inflation():
-            shift = 0.03
-            deltas["Bonds"] += shift
-            deltas["Stocks"] -= shift
-            rationale.append(f"Inflation {env.inflation:.1f}% > 5% threshold → increase bond allocation by {shift*100:.0f}pp")
+            self._move_toward(deltas, "Bonds", target=0.62, speed=0.12)
+            self._move_toward(deltas, "Stocks", target=0.28, speed=0.12)
+            rationale.append(f"Inflation {env.inflation:.1f}% > 5% threshold → drifting toward higher bond allocation")
 
-        # Rule 2: weak growth -> de-risk
+        # Rule 2: weak growth -> target lower equities
         if env.gdp_growth < 1.0:
-            shift = 0.025
-            deltas["Stocks"] -= shift
-            deltas["Bonds"] += shift
-            rationale.append(f"GDP growth {env.gdp_growth:.1f}% weak (<1%) → reduce equity exposure by {shift*100:.1f}pp")
+            self._move_toward(deltas, "Stocks", target=0.30, speed=0.10)
+            self._move_toward(deltas, "Bonds", target=0.58, speed=0.10)
+            rationale.append(f"GDP growth {env.gdp_growth:.1f}% weak (<1%) → drifting toward reduced equity exposure")
 
         # Rule 3: contrarian buy-the-dip after a sharp stock drawdown
         recent_stock_return = market.recent_return("Stocks", lookback=5)
         if recent_stock_return < -8.0:
-            shift = 0.04
-            deltas["Stocks"] += shift
-            deltas["Bonds"] -= shift
-            rationale.append(f"Stocks down {recent_stock_return:.1f}% over 5 periods → contrarian buy, increase equities by {shift*100:.0f}pp")
+            self._move_toward(deltas, "Stocks", target=0.55, speed=0.15)
+            self._move_toward(deltas, "Bonds", target=0.35, speed=0.15)
+            rationale.append(f"Stocks down {recent_stock_return:.1f}% over 5 periods → contrarian buy, drifting toward higher equities")
 
         # Rule 4: trim equities after a large rally (valuation discipline)
-        if recent_stock_return > 15.0:
-            shift = 0.03
-            deltas["Stocks"] -= shift
-            deltas["Gold"] += shift
-            rationale.append(f"Stocks up {recent_stock_return:.1f}% over 5 periods → valuations excessive, trim equities by {shift*100:.0f}pp")
+        elif recent_stock_return > 15.0:
+            self._move_toward(deltas, "Stocks", target=0.32, speed=0.12)
+            self._move_toward(deltas, "Gold", target=0.22, speed=0.12)
+            rationale.append(f"Stocks up {recent_stock_return:.1f}% over 5 periods → valuations excessive, trimming equities")
 
         # Rule 5: oil crisis -> modest flight to gold as a real-asset hedge
         if env.is_oil_crisis():
-            shift = 0.02
-            deltas["Gold"] += shift
-            deltas["Stocks"] -= shift
-            rationale.append(f"Oil shock {env.oil_shock:.1f}% → modest reallocation to gold ({shift*100:.0f}pp)")
+            self._move_toward(deltas, "Gold", target=0.22, speed=0.08)
+            self._move_toward(deltas, "Stocks", target=0.33, speed=0.08)
+            rationale.append(f"Oil shock {env.oil_shock:.1f}% → modest reallocation toward gold")
 
+        # Rule 6 (default / mean reversion): absent any active signal, drift
+        # gently back toward the strategic 40/50/10 policy mix — this is
+        # what gives a pension fund its long-horizon, anchor-like character.
         if not rationale:
-            rationale.append("No threshold breached → maintain strategic allocation")
+            self._move_toward(deltas, "Stocks", target=base_stocks, speed=0.06)
+            self._move_toward(deltas, "Bonds", target=base_bonds, speed=0.06)
+            self._move_toward(deltas, "Gold", target=base_gold, speed=0.06)
+            rationale.append("No threshold breached → drifting back toward strategic 40/50/10 policy mix")
 
         return AgentOrder(self.name, deltas, rationale)
 
@@ -498,52 +529,64 @@ class HedgeFund(Agent):
         super().__init__({"Stocks": 1.20, "Cash": -0.20})
 
     def decide(self, env: MacroEnvironment, market: "Market", period: int) -> AgentOrder:
-        deltas = {"Stocks": 0.0, "Cash": 0.0, "Gold": 0.0, "Bonds": 0.0}
+        deltas: Dict[str, float] = {}
         rationale: List[str] = []
+        base_stocks, base_cash = 1.20, -0.20
 
-        recent_stock_return = market.recent_return("Stocks", lookback=3)
-
-        # Rule 1: momentum up -> add leveraged exposure
-        if recent_stock_return > 3.0:
-            shift = 0.08
-            deltas["Stocks"] += shift
-            deltas["Cash"] -= shift
-            rationale.append(f"Stock momentum +{recent_stock_return:.1f}% (3-period) → increase leveraged exposure by {shift*100:.0f}pp")
-
-        # Rule 2: momentum down -> cut exposure and short
-        elif recent_stock_return < -3.0:
-            shift = 0.10
-            deltas["Stocks"] -= shift
-            deltas["Cash"] += shift
-            rationale.append(f"Stock momentum {recent_stock_return:.1f}% (3-period) → cut exposure / short weak assets, reduce stocks by {shift*100:.0f}pp")
-
-        # Rule 3: bullish sentiment amplifies leverage
+        # Use a smoothed momentum signal (average per-period return over the
+        # last 6 periods) rather than a raw point-to-point comparison, so a
+        # single noisy down-period near a peak doesn't immediately look like
+        # a trend reversal — real momentum desks confirm a trend over
+        # multiple observations before flipping a leveraged position.
+        recent_stock_return = market.smoothed_momentum("Stocks", lookback=6)
         sentiment_score = SENTIMENT_SCORE.get(env.sentiment, 0)
+
+        # Combine momentum + sentiment into a single target stock weight,
+        # then move toward it. Using one target (rather than several
+        # competing additive deltas) avoids rules fighting each other every
+        # period and gives a clean, bounded equilibrium for any persistent
+        # regime — exactly the "chases trends, uses leverage" character of
+        # a momentum hedge fund, but one that settles rather than runs away.
+        target_stocks = base_stocks
+        if recent_stock_return > 1.5:
+            target_stocks = 1.50
+            rationale.append(f"Stock momentum +{recent_stock_return:.2f}%/period (6-period avg) → target increased leveraged exposure")
+        elif recent_stock_return < -1.5:
+            target_stocks = 0.70
+            rationale.append(f"Stock momentum {recent_stock_return:.2f}%/period (6-period avg) → target cut exposure / shift toward shorting weak assets")
+
         if sentiment_score >= 1:
-            shift = 0.04 * sentiment_score
-            deltas["Stocks"] += shift
-            deltas["Cash"] -= shift
-            rationale.append(f"Sentiment '{env.sentiment}' → add leverage, increase stocks by {shift*100:.0f}pp")
+            target_stocks += 0.12 * sentiment_score
+            rationale.append(f"Sentiment '{env.sentiment}' → target additional leverage")
         elif sentiment_score <= -1:
-            shift = 0.05 * abs(sentiment_score)
-            deltas["Stocks"] -= shift
-            deltas["Cash"] += shift
-            rationale.append(f"Sentiment '{env.sentiment}' → de-risk, reduce stocks by {shift*100:.0f}pp")
+            target_stocks -= 0.15 * abs(sentiment_score)
+            rationale.append(f"Sentiment '{env.sentiment}' → target de-risking")
 
-        # Rule 4: recession or oil crisis -> tactical rotation to gold
-        if env.is_recession() or env.is_oil_crisis():
-            shift = 0.05
-            deltas["Gold"] += shift
-            deltas["Stocks"] -= shift
-            trigger = "Recession" if env.is_recession() else "Oil crisis"
-            rationale.append(f"{trigger} detected → tactical rotation into gold, +{shift*100:.0f}pp")
-
-        # Rule 5: rate shock -> cut leverage (higher financing cost)
         if env.is_high_rates():
-            shift = 0.03
-            deltas["Stocks"] -= shift
-            deltas["Cash"] += shift
-            rationale.append(f"Interest rate {env.interest_rate:.1f}% > 5% → deleverage, reduce stocks by {shift*100:.0f}pp")
+            target_stocks -= 0.15
+            rationale.append(f"Interest rate {env.interest_rate:.1f}% > 5% → target deleveraging (higher financing cost)")
+
+        target_stocks = max(self.allocation_bounds["Stocks"][0], min(self.allocation_bounds["Stocks"][1], target_stocks))
+        # Speed governs how much of the gap to the target is closed in one
+        # period. 0.12 means a full momentum reversal (e.g. target swinging
+        # from 1.65 to 0.20) plays out over several periods rather than as a
+        # single violent reallocation — consistent with even aggressive
+        # funds unwinding leveraged positions over days/weeks, not instantly.
+        speed = 0.08
+        self._move_toward(deltas, "Stocks", target=target_stocks, speed=speed)
+        # Cash is the financing leg: it moves opposite to stocks 1:1 so that
+        # leverage (stocks > 100%) is funded by negative cash (borrowing).
+        deltas["Cash"] = deltas.get("Cash", 0.0) - deltas.get("Stocks", 0.0)
+
+        # Tactical gold rotation during recession / oil crisis — kept as a
+        # separate small target-seeking move on a different asset so it
+        # doesn't interact with the stocks/cash financing pair above.
+        if env.is_recession() or env.is_oil_crisis():
+            self._move_toward(deltas, "Gold", target=0.30, speed=0.12)
+            trigger = "Recession" if env.is_recession() else "Oil crisis"
+            rationale.append(f"{trigger} detected → tactical rotation into gold")
+        else:
+            self._move_toward(deltas, "Gold", target=0.0, speed=0.08)
 
         if not rationale:
             rationale.append("No momentum or sentiment signal → hold current trend position")
@@ -578,45 +621,48 @@ class RetailInvestor(Agent):
         super().__init__({"Stocks": 0.80, "Cash": 0.20})
 
     def decide(self, env: MacroEnvironment, market: "Market", period: int) -> AgentOrder:
-        deltas = {"Stocks": 0.0, "Cash": 0.0, "Bonds": 0.0, "Gold": 0.0}
+        deltas: Dict[str, float] = {}
         rationale: List[str] = []
+        base_stocks = 0.80
 
         sentiment_score = SENTIMENT_SCORE.get(env.sentiment, 0)
-        recent_stock_return = market.recent_return("Stocks", lookback=3)
-
-        # Rule 1: sentiment-driven buying / selling — the dominant retail driver
-        if sentiment_score >= 1:
-            shift = 0.05 * sentiment_score
-            deltas["Stocks"] += shift
-            deltas["Cash"] -= shift
-            rationale.append(f"Sentiment '{env.sentiment}' → buy winners, increase stocks by {shift*100:.0f}pp")
-        elif sentiment_score <= -1:
-            shift = 0.07 * abs(sentiment_score)
-            deltas["Stocks"] -= shift
-            deltas["Cash"] += shift
-            rationale.append(f"Sentiment '{env.sentiment}' → panic, reduce stocks by {shift*100:.0f}pp")
-
-        # Rule 2: performance chasing — buy what's already going up
-        if recent_stock_return > 5.0:
-            shift = 0.03
-            deltas["Stocks"] += shift
-            deltas["Cash"] -= shift
-            rationale.append(f"Stocks up {recent_stock_return:.1f}% (3-period) → performance-chase, +{shift*100:.0f}pp stocks")
-
-        # Rule 3: drawdown panic — retail sells into weakness, amplifying volatility
+        recent_stock_return_3 = market.recent_return("Stocks", lookback=3)
         recent_stock_return_5 = market.recent_return("Stocks", lookback=5)
-        if recent_stock_return_5 < -6.0:
-            shift = 0.10
-            deltas["Stocks"] -= shift
-            deltas["Cash"] += shift
-            rationale.append(f"Drawdown {recent_stock_return_5:.1f}% (5-period) → panic sell, -{shift*100:.0f}pp stocks")
 
-        # Rule 4: recession -> aggressive de-risking to cash
+        # As with the Hedge Fund, all signals are blended into one target
+        # stock weight and the agent moves a fraction of the way toward it
+        # each period. This produces the right qualitative behavior — buy
+        # winners, panic-sell drawdowns, chase rallies — without a
+        # persistent signal (e.g. 30 periods of "Bearish" sentiment in a
+        # row) causing stock weight to run past 0% or compound the price
+        # into an unrealistic spiral.
+        target_stocks = base_stocks
+
+        if sentiment_score >= 1:
+            target_stocks += 0.10 * sentiment_score
+            rationale.append(f"Sentiment '{env.sentiment}' → target buying winners, higher stock weight")
+        elif sentiment_score <= -1:
+            target_stocks -= 0.18 * abs(sentiment_score)
+            rationale.append(f"Sentiment '{env.sentiment}' → target panic reduction in stock weight")
+
+        if recent_stock_return_3 > 5.0:
+            target_stocks += 0.10
+            rationale.append(f"Stocks up {recent_stock_return_3:.1f}% (3-period) → target performance-chasing, higher stock weight")
+
+        if recent_stock_return_5 < -6.0:
+            target_stocks -= 0.25
+            rationale.append(f"Drawdown {recent_stock_return_5:.1f}% (5-period) → target panic sell, much lower stock weight")
+
         if env.is_recession():
-            shift = 0.08
-            deltas["Stocks"] -= shift
-            deltas["Cash"] += shift
-            rationale.append(f"Recession (GDP {env.gdp_growth:.1f}%) → sell aggressively, -{shift*100:.0f}pp stocks")
+            target_stocks -= 0.20
+            rationale.append(f"Recession (GDP {env.gdp_growth:.1f}%) → target aggressive de-risking to cash")
+
+        target_stocks = max(self.allocation_bounds["Stocks"][0], min(self.allocation_bounds["Stocks"][1], target_stocks))
+        speed = 0.18  # retail investors react quickly and emotionally, but not instantly
+        self._move_toward(deltas, "Stocks", target=target_stocks, speed=speed)
+        # Cash absorbs whatever stocks gave up/took — retail here is
+        # unleveraged and long-only, so cash is simply 1 - stocks.
+        deltas["Cash"] = deltas.get("Cash", 0.0) - deltas.get("Stocks", 0.0)
 
         if not rationale:
             rationale.append("Neutral sentiment, no strong signal → hold current position")
@@ -645,7 +691,7 @@ class Market:
         self.env = env
         self.rng = random.Random(seed)
         self.assets: Dict[str, Asset] = {
-            "Stocks": Asset("Stocks", start_price=100.0, sensitivity=18.0, base_volatility=0.9),
+            "Stocks": Asset("Stocks", start_price=100.0, sensitivity=14.0, base_volatility=0.5),
             "Bonds": Asset("Bonds", start_price=100.0, sensitivity=9.0, base_volatility=0.35),
             "Gold": Asset("Gold", start_price=100.0, sensitivity=11.0, base_volatility=0.55),
         }
@@ -659,6 +705,24 @@ class Market:
             return 0.0
         lb = min(lookback, len(history) - 1)
         return (history[-1] / history[-1 - lb] - 1) * 100.0
+
+    def smoothed_momentum(self, asset_name: str, lookback: int) -> float:
+        """
+        A smoothed momentum signal: the average of the per-period returns
+        over the lookback window, rather than a single point-to-point
+        comparison. This filters out one-off noisy periods from looking
+        like a trend reversal, which is what real momentum strategies do
+        (e.g. trade on a moving average of returns, not the latest tick).
+        """
+        history = self.assets[asset_name].price_history
+        if len(history) < 3:
+            return 0.0
+        lb = min(lookback, len(history) - 1)
+        window = history[-(lb + 1):]
+        period_returns = [
+            (window[i] / window[i - 1] - 1) * 100.0 for i in range(1, len(window))
+        ]
+        return sum(period_returns) / len(period_returns)
 
     def aggregate_demand(self, orders: List[AgentOrder]) -> Dict[str, float]:
         """
@@ -755,12 +819,24 @@ class SimulationEngine:
         new_gdp = mean_revert(prev_env.gdp_growth, self.base_env.gdp_growth, 0.3, lower=-10.0, upper=10.0)
         new_oil = mean_revert(prev_env.oil_shock, self.base_env.oil_shock, 1.5, lower=-50.0, upper=150.0)
 
-        # Sentiment: small chance of drifting one notch toward neutral or
-        # randomly, otherwise persists (sentiment is sticky in the short run).
+        # Sentiment: mean-reverts toward the user-selected BASELINE sentiment,
+        # not a pure unbiased random walk. Without this pull, sentiment would
+        # wander away from the chosen scenario over a 100-period run (e.g. a
+        # "Bull Market" baseline of Bullish could drift all the way to Very
+        # Bearish purely by chance), which would silently defeat the
+        # scenario selector. The bias direction is computed relative to the
+        # BASE index so the simulation reliably reflects the chosen regime
+        # while still allowing realistic period-to-period texture.
+        base_idx = SENTIMENT_LEVELS.index(self.base_env.sentiment)
         idx = SENTIMENT_LEVELS.index(prev_env.sentiment)
-        if self.rng.random() < 0.12:
-            idx += self.rng.choice([-1, 1])
-            idx = max(0, min(len(SENTIMENT_LEVELS) - 1, idx))
+        if self.rng.random() < 0.18:
+            if idx < base_idx:
+                step = 1
+            elif idx > base_idx:
+                step = -1
+            else:
+                step = self.rng.choice([-1, 1])
+            idx = max(0, min(len(SENTIMENT_LEVELS) - 1, idx + step))
         new_sentiment = SENTIMENT_LEVELS[idx]
 
         return MacroEnvironment(new_inflation, new_rate, new_gdp, new_oil, new_sentiment)
@@ -847,14 +923,20 @@ def generate_institutional_summary(engine: SimulationEngine) -> str:
     stock_bond_corr = stocks.pct_change().corr(bonds.pct_change())
     stock_gold_corr = stocks.pct_change().corr(gold.pct_change())
 
-    # Net demand contribution by agent, summed over the whole run
-    net_demand_by_agent = {agent.name: 0.0 for agent in engine.agents}
+    # Net demand contribution by agent, summed over the whole run. We use
+    # net STOCKS demand specifically (rather than summing across all assets,
+    # including Cash) because Cash deltas are mechanically the offsetting
+    # leg of a Stocks trade for several agents — summing them together would
+    # cancel out the very signal we're trying to measure ("who pushed
+    # equities the hardest"). Stocks is the asset every agent trades, so it
+    # is the most meaningful common basis for comparison.
+    net_stock_demand_by_agent = {agent.name: 0.0 for agent in engine.agents}
     for agent in engine.agents:
         for order in agent.trade_log:
-            net_demand_by_agent[agent.name] += sum(order.allocation_deltas.values())
+            net_stock_demand_by_agent[agent.name] += order.allocation_deltas.get("Stocks", 0.0)
 
-    biggest_net_buyer = max(net_demand_by_agent, key=net_demand_by_agent.get)
-    biggest_net_seller = min(net_demand_by_agent, key=net_demand_by_agent.get)
+    biggest_net_buyer = max(net_stock_demand_by_agent, key=net_stock_demand_by_agent.get)
+    biggest_net_seller = min(net_stock_demand_by_agent, key=net_stock_demand_by_agent.get)
 
     base_env = engine.base_env
     regime_bits = []
@@ -917,16 +999,28 @@ def generate_institutional_summary(engine: SimulationEngine) -> str:
         )
     paragraphs.append(gold_desc)
 
-    behavior_desc = (
-        f"At the agent level, {biggest_net_buyer} was the largest net source of buying "
-        f"pressure over the simulation, while {biggest_net_seller} was the largest net "
-        f"seller. This is broadly consistent with the calibrated archetypes: pension funds "
-        f"provide a stabilizing, counter-cyclical bid during drawdowns and rotate toward "
-        f"bonds as inflation protection; hedge funds amplify directional moves through "
-        f"leveraged, momentum-driven positioning; and retail investors tend to chase "
-        f"winners during rallies and exit aggressively during drawdowns, contributing "
-        f"disproportionately to realized volatility."
-    )
+    if biggest_net_buyer == biggest_net_seller:
+        behavior_desc = (
+            f"At the agent level, net positioning shifts were modest and broadly balanced across "
+            f"the three agent types over this run, with {biggest_net_buyer} showing the largest "
+            f"absolute swing in equity allocation. This is broadly consistent with the calibrated "
+            f"archetypes: pension funds provide a stabilizing, counter-cyclical bid during "
+            f"drawdowns and rotate toward bonds as inflation protection; hedge funds amplify "
+            f"directional moves through leveraged, momentum-driven positioning; and retail "
+            f"investors tend to chase winners during rallies and exit aggressively during "
+            f"drawdowns, contributing disproportionately to realized volatility."
+        )
+    else:
+        behavior_desc = (
+            f"At the agent level, {biggest_net_buyer} was the largest net source of buying "
+            f"pressure on equities over the simulation, while {biggest_net_seller} was the "
+            f"largest net seller. This is broadly consistent with the calibrated archetypes: "
+            f"pension funds provide a stabilizing, counter-cyclical bid during drawdowns and "
+            f"rotate toward bonds as inflation protection; hedge funds amplify directional "
+            f"moves through leveraged, momentum-driven positioning; and retail investors tend "
+            f"to chase winners during rallies and exit aggressively during drawdowns, "
+            f"contributing disproportionately to realized volatility."
+        )
     paragraphs.append(behavior_desc)
 
     closing = (
