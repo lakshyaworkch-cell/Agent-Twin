@@ -987,69 +987,45 @@ def run_consistency_tests(mc_results: Dict, scenario_name: str) -> List[Dict]:
     return tests
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PART 4: ECONOMIC DOMINANCE SCORE
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Part 4: Economic Dominance Score ─────────────────────────────────────
+st.markdown("---")
+st.markdown("##### 📊  Economic Dominance Score")
 
-def compute_economic_dominance(engine: SimulationEngine) -> Dict:
-    """
-    Proxy for economic signal strength:
-    R² of a simple linear model: macro vars → asset return per period.
-    Uses GDP growth, inflation, interest rate as predictors for stock returns.
-    """
-    env_hist = engine.market.env_history
-    prices   = engine.market.assets["Stocks"].price_history
+# Use the single-run engine if available; otherwise run seed 0
+engine = st.session_state.get("engine")
 
-    if len(prices) < 10 or len(env_hist) < 5:
-        return {"r2": None, "signal_pct": None, "noise_pct": None, "warning": False}
+if engine is None:
+    env_ed = _make_env()
+    engine = SimulationEngine(
+        env_ed,
+        periods=st.session_state["periods"],
+        seed=0
+    )
+    engine.run()
 
-    min_len = min(len(prices) - 1, len(env_hist))
-    rets = [(prices[i] / prices[i-1] - 1) * 100 for i in range(1, min_len + 1)]
-    gdps  = [env_hist[i].gdp_growth   for i in range(min_len)]
-    infs  = [env_hist[i].inflation     for i in range(min_len)]
-    rates = [env_hist[i].interest_rate for i in range(min_len)]
-    reg_enc = [1 if env_hist[i].regime == "Expansion" else
-               -1 if env_hist[i].regime == "Recession" else 0
-               for i in range(min_len)]
+dom = compute_economic_dominance(engine)
 
-    y = np.array(rets)
-    X = np.column_stack([gdps, infs, rates, reg_enc, np.ones(min_len)])
+if dom["r2"] is not None:
+    sig = dom["signal_pct"]
+    noise = dom["noise_pct"]
 
-    try:
-        coeffs, residuals, rank, sv = np.linalg.lstsq(X, y, rcond=None)
-        y_hat = X @ coeffs
-        ss_res = np.sum((y - y_hat) ** 2)
-        ss_tot = np.sum((y - np.mean(y)) ** 2)
-        r2 = max(0.0, 1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
-    except Exception:
-        r2 = 0.0
+    col1, col2, col3 = st.columns(3)
 
-    signal_pct = r2 * 100
-    noise_pct  = (1 - r2) * 100
-    warning    = noise_pct > 70  # noise explains >70% → issue warning
+    col1.markdown(
+        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
+        f"<div class='metric-label'>Economic Signal Strength</div>"
+        f"<div class='metric-value'>{sig:.1f}%</div>"
+        f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div></div>",
+        unsafe_allow_html=True)
 
-    # Per-asset breakdown
-    asset_r2 = {}
-    for asset_name in ["Stocks", "Bonds", "Gold"]:
-        ap = engine.market.assets[asset_name].price_history
-        min_la = min(len(ap) - 1, len(env_hist))
-        ar = [(ap[i] / ap[i-1] - 1) * 100 for i in range(1, min_la + 1)]
-        ya = np.array(ar)
-        Xa = np.column_stack([gdps[:min_la], infs[:min_la], rates[:min_la],
-                               reg_enc[:min_la], np.ones(min_la)])
-        try:
-            ca, _, _, _ = np.linalg.lstsq(Xa, ya, rcond=None)
-            yh = Xa @ ca
-            ss_r = np.sum((ya - yh) ** 2)
-            ss_t = np.sum((ya - np.mean(ya)) ** 2)
-            asset_r2[asset_name] = max(0.0, 1 - ss_r / ss_t) if ss_t > 0 else 0.0
-        except Exception:
-            asset_r2[asset_name] = 0.0
+    col2.markdown(
+        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
+        f"<div class='metric-label'>Noise Contribution</div>"
+        f"<div class='metric-value'>{noise:.1f}%</div>"
+        f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div></div>",
+        unsafe_allow_html=True)
 
-    return {
-        "r2": r2, "signal_pct": signal_pct, "noise_pct": noise_pct,
-        "warning": warning, "asset_r2": asset_r2
-    }
-
+    r2_bars = dom.get("asset_r2", {})
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 5: ROBUSTNESS / CONFIDENCE LEVEL
 # ══════════════════════════════════════════════════════════════════════════════
