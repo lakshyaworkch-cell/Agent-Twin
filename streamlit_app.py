@@ -1728,16 +1728,19 @@ def render_monte_carlo_section():
         noise = dom["noise_pct"]
 
         col1, col2, col3 = st.columns(3)
+        sig_color   = C["green"] if sig > 40 else C["amber"] if sig > 25 else C["red"]
+        noise_color = C["red"] if noise > 70 else C["amber"] if noise > 55 else C["green"]
+
         col1.markdown(
             f"<div class='panel' style='text-align:center;padding:.7rem;'>"
             f"<div class='metric-label'>Economic Signal Strength</div>"
-            f"<div class='metric-value' style='color:{C[\"green\"] if sig > 40 else C[\"amber\"] if sig > 25 else C[\"red\"]};'>{sig:.1f}%</div>"
+            f"<div class='metric-value' style='color:{sig_color};'>{sig:.1f}%</div>"
             f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div></div>",
             unsafe_allow_html=True)
         col2.markdown(
             f"<div class='panel' style='text-align:center;padding:.7rem;'>"
             f"<div class='metric-label'>Noise Contribution</div>"
-            f"<div class='metric-value' style='color:{C[\"red\"] if noise > 70 else C[\"amber\"] if noise > 55 else C[\"green\"]};'>{noise:.1f}%</div>"
+            f"<div class='metric-value' style='color:{noise_color};'>{noise:.1f}%</div>"
             f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div></div>",
             unsafe_allow_html=True)
 
