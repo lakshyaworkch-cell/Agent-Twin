@@ -1,270 +1,290 @@
 """
 ==================================================================================
- AGENT TWIN — A Digital Twin of Financial Markets
+ AGENT TWIN v2 — Valuation-Aware Institutional Market Simulator
 ==================================================================================
 
-WHAT THIS APPLICATION IS
--------------------------
-Agent Twin is NOT a stock screener, factor model, or portfolio optimizer.
-It is an agent-based simulation in which asset prices EMERGE from the
-interaction of distinct investor archetypes (Pension Fund, Hedge Fund,
-Retail Investor) reacting to a shared macroeconomic environment.
-
-Instead of fitting historical correlations, we simulate behavior:
-    macro environment  -->  agent beliefs  -->  agent orders  -->
-    aggregate demand    -->  price changes  -->  new environment  -->  ...
-
-WHY THIS MATTERS
------------------
-Classic finance answers "what was the historical correlation between
-inflation and bonds?". Agent Twin instead asks "if pension funds behave
-like risk-averse long-term allocators, and hedge funds behave like
-momentum chasers, and retail investors behave like sentiment-driven
-panic sellers — what price path does that produce?" This is closer to
-how real markets actually form prices: through the interaction of
-heterogeneous, boundedly-rational participants.
-
-ARCHITECTURE (OOP)
--------------------
-    Asset             -- a tradeable instrument with a price history
-    Agent (abstract)   -- base class for any market participant
-        PensionFund    -- long-horizon, risk-averse, contrarian
-        HedgeFund      -- momentum-driven, leveraged, trend-chasing
-        RetailInvestor -- sentiment-driven, pro-cyclical, panic-prone
-    Market             -- owns the assets and the macro environment
-    SimulationEngine   -- orchestrates the period-by-period simulation loop
-
-The whole app is a single file by design (per spec) so it can be deployed
-to Streamlit Community Cloud with zero configuration beyond
-`streamlit_app.py` + `requirements.txt`.
-
-NO external AI APIs are used anywhere. The "Institutional Analysis Panel"
-is generated entirely from the simulation's own numbers via templated,
-rule-based natural-language generation.
+Upgrades over v1:
+  · Asset Valuation Layer    — P/E, earnings yield, bond yield/duration, gold
+                               inflation-sensitivity; expected returns drive agents
+  · Pension Fund             — funding ratio, liability duration, required return
+  · Hedge Fund               — trend + valuation signals, risk budget, gross/net
+                               exposure, leverage ratio
+  · Retail Investor          — fear/greed index, news sensitivity
+  · Market Regimes           — Expansion / Slowdown / Recession / Recovery with
+                               evolving probabilities; agents react per-regime
+  · Institutional Dashboard  — funding ratio, expected returns, valuations,
+                               regime probability, risk contribution charts
 ==================================================================================
 """
 
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import streamlit as st
+import plotly.express as px
 from plotly.subplots import make_subplots
+import streamlit as st
 
-# ==================================================================================
-# PAGE CONFIG & GLOBAL THEME
-# ==================================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ──────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Agent Twin | Digital Twin of Financial Markets",
+    page_title="Agent Twin v2 | Institutional Market Simulator",
     page_icon="🏛️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ----------------------------------------------------------------------------------
-# COLOR PALETTE — dark institutional theme (Bloomberg / AQR / Bridgewater inspired)
-# Dark slate background, deep green accents, muted gold/amber for warnings.
-# ----------------------------------------------------------------------------------
-COLORS = {
-    "bg": "#0b0f0e",
-    "panel": "#111614",
-    "panel_alt": "#151b18",
-    "border": "#1f2a25",
-    "text": "#dfe6e2",
-    "text_dim": "#8a9690",
-    "accent_green": "#16a34a",
-    "accent_green_dim": "#0f5132",
-    "accent_amber": "#c08a2e",
-    "accent_red": "#b3473a",
-    "accent_blue": "#3b6e91",
-    "stock": "#2fae6a",
-    "bond": "#3b82a6",
-    "gold": "#c08a2e",
-    "pension": "#3b82a6",
-    "hedge": "#b3473a",
-    "retail": "#c08a2e",
+# ──────────────────────────────────────────────────────────────────────────────
+# COLOUR PALETTE  (deep institutional: near-black, cold green, amber, slate)
+# ──────────────────────────────────────────────────────────────────────────────
+C = {
+    "bg":           "#080c0b",
+    "panel":        "#0d1210",
+    "panel_alt":    "#111816",
+    "border":       "#1a2421",
+    "text":         "#d8e3de",
+    "text_dim":     "#7a9088",
+    "green":        "#16a34a",
+    "green_dim":    "#0c3d24",
+    "amber":        "#c08a2e",
+    "red":          "#b3473a",
+    "blue":         "#3b7bab",
+    "purple":       "#7c5cbf",
+    # asset colours
+    "stock":        "#2fae6a",
+    "bond":         "#3b82a6",
+    "gold":         "#c08a2e",
+    # agent colours
+    "pension":      "#3b82a6",
+    "hedge":        "#b3473a",
+    "retail":       "#c08a2e",
+    # regime colours
+    "expansion":    "#16a34a",
+    "slowdown":     "#c08a2e",
+    "recession":    "#b3473a",
+    "recovery":     "#3b7bab",
 }
 
-CUSTOM_CSS = f"""
+CSS = f"""
 <style>
-    .stApp {{
-        background-color: {COLORS["bg"]};
-        color: {COLORS["text"]};
-    }}
-    section[data-testid="stSidebar"] {{
-        background-color: {COLORS["panel"]};
-        border-right: 1px solid {COLORS["border"]};
-    }}
-    h1, h2, h3, h4 {{
-        color: {COLORS["text"]} !important;
-        font-family: 'IBM Plex Mono', 'Courier New', monospace;
-        letter-spacing: 0.02em;
-    }}
-    .agent-twin-header {{
-        font-family: 'IBM Plex Mono', 'Courier New', monospace;
-        font-size: 1.9rem;
-        font-weight: 700;
-        color: {COLORS["text"]};
-        border-bottom: 2px solid {COLORS["accent_green_dim"]};
-        padding-bottom: 0.4rem;
-        margin-bottom: 0.1rem;
-    }}
-    .agent-twin-subheader {{
-        color: {COLORS["text_dim"]};
-        font-size: 0.95rem;
-        margin-bottom: 1.2rem;
-    }}
-    .panel-card {{
-        background-color: {COLORS["panel"]};
-        border: 1px solid {COLORS["border"]};
-        border-radius: 6px;
-        padding: 1.1rem 1.3rem;
-        margin-bottom: 1rem;
-    }}
-    .metric-label {{
-        color: {COLORS["text_dim"]};
-        font-size: 0.78rem;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-    }}
-    .rule-row {{
-        font-family: 'IBM Plex Mono', 'Courier New', monospace;
-        font-size: 0.83rem;
-        color: {COLORS["text_dim"]};
-        border-left: 2px solid {COLORS["accent_green_dim"]};
-        padding: 0.15rem 0 0.15rem 0.6rem;
-        margin-bottom: 0.25rem;
-    }}
-    .log-line {{
-        font-family: 'IBM Plex Mono', 'Courier New', monospace;
-        font-size: 0.82rem;
-        color: {COLORS["text_dim"]};
-        padding: 0.1rem 0;
-    }}
-    .log-period {{
-        color: {COLORS["accent_green"]};
-        font-weight: 700;
-    }}
-    .badge {{
-        display: inline-block;
-        font-size: 0.72rem;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        padding: 0.15rem 0.55rem;
-        border-radius: 3px;
-        background-color: {COLORS["panel_alt"]};
-        border: 1px solid {COLORS["border"]};
-        color: {COLORS["text_dim"]};
-        margin-right: 0.4rem;
-    }}
-    div[data-testid="stMetricValue"] {{
-        font-family: 'IBM Plex Mono', 'Courier New', monospace;
-        color: {COLORS["text"]};
-    }}
-    .stButton button {{
-        background-color: {COLORS["panel_alt"]};
-        color: {COLORS["text"]};
-        border: 1px solid {COLORS["accent_green_dim"]};
-        border-radius: 4px;
-        font-family: 'IBM Plex Mono', 'Courier New', monospace;
-        font-size: 0.85rem;
-    }}
-    .stButton button:hover {{
-        border-color: {COLORS["accent_green"]};
-        color: {COLORS["accent_green"]};
-    }}
-    hr {{
-        border-color: {COLORS["border"]};
-    }}
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
+
+.stApp {{ background-color:{C['bg']}; color:{C['text']}; }}
+section[data-testid="stSidebar"] {{
+    background-color:{C['panel']};
+    border-right:1px solid {C['border']};
+}}
+h1,h2,h3,h4 {{ color:{C['text']} !important; font-family:'IBM Plex Mono',monospace; letter-spacing:.02em; }}
+
+.at-header {{
+    font-family:'IBM Plex Mono',monospace; font-size:1.9rem; font-weight:700;
+    color:{C['text']}; border-bottom:2px solid {C['green_dim']};
+    padding-bottom:.4rem; margin-bottom:.1rem;
+}}
+.at-sub {{
+    color:{C['text_dim']}; font-size:.9rem; margin-bottom:1.2rem;
+    font-family:'IBM Plex Sans',sans-serif;
+}}
+.panel {{
+    background:{C['panel']}; border:1px solid {C['border']};
+    border-radius:6px; padding:1rem 1.2rem; margin-bottom:.8rem;
+}}
+.panel-dark {{
+    background:{C['panel_alt']}; border:1px solid {C['border']};
+    border-radius:6px; padding:1rem 1.2rem; margin-bottom:.8rem;
+}}
+.metric-label {{
+    color:{C['text_dim']}; font-size:.72rem; text-transform:uppercase;
+    letter-spacing:.08em; font-family:'IBM Plex Mono',monospace;
+}}
+.metric-value {{
+    font-family:'IBM Plex Mono',monospace; font-size:1.35rem; margin-top:.15rem;
+}}
+.badge {{
+    display:inline-block; font-size:.68rem; text-transform:uppercase;
+    letter-spacing:.06em; padding:.12rem .45rem; border-radius:3px;
+    background:{C['panel_alt']}; border:1px solid {C['border']};
+    color:{C['text_dim']}; margin-right:.35rem;
+    font-family:'IBM Plex Mono',monospace;
+}}
+.rule-row {{
+    font-family:'IBM Plex Mono',monospace; font-size:.8rem;
+    color:{C['text_dim']}; border-left:2px solid {C['green_dim']};
+    padding:.12rem 0 .12rem .55rem; margin-bottom:.2rem;
+}}
+.log-line {{ font-family:'IBM Plex Mono',monospace; font-size:.8rem; color:{C['text_dim']}; padding:.08rem 0; }}
+.log-period {{ color:{C['green']}; font-weight:700; }}
+div[data-testid="stMetricValue"] {{ font-family:'IBM Plex Mono',monospace; color:{C['text']}; }}
+.stButton button {{
+    background:{C['panel_alt']}; color:{C['text']};
+    border:1px solid {C['green_dim']}; border-radius:4px;
+    font-family:'IBM Plex Mono',monospace; font-size:.82rem;
+}}
+.stButton button:hover {{ border-color:{C['green']}; color:{C['green']}; }}
+hr {{ border-color:{C['border']}; }}
+.regime-pill {{
+    display:inline-block; font-size:.75rem; font-weight:600;
+    padding:.18rem .7rem; border-radius:12px; margin-right:.4rem;
+    font-family:'IBM Plex Mono',monospace; letter-spacing:.04em;
+}}
 </style>
 """
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+st.markdown(CSS, unsafe_allow_html=True)
 
-PLOTLY_TEMPLATE = dict(
-    layout=go.Layout(
-        paper_bgcolor=COLORS["panel"],
-        plot_bgcolor=COLORS["panel"],
-        font=dict(color=COLORS["text"], family="IBM Plex Mono, Courier New, monospace", size=12),
-        xaxis=dict(gridcolor=COLORS["border"], zerolinecolor=COLORS["border"]),
-        yaxis=dict(gridcolor=COLORS["border"], zerolinecolor=COLORS["border"]),
-        legend=dict(bgcolor="rgba(0,0,0,0)"),
-        margin=dict(l=40, r=20, t=40, b=40),
-    )
+LAYOUT = dict(
+    paper_bgcolor=C["panel"], plot_bgcolor=C["panel"],
+    font=dict(color=C["text"], family="IBM Plex Mono, monospace", size=11),
+    xaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
+    yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
+    legend=dict(bgcolor="rgba(0,0,0,0)"),
+    margin=dict(l=44, r=16, t=44, b=36),
 )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET REGIMES
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ==================================================================================
-# DOMAIN MODEL
-# ==================================================================================
+REGIMES = ["Expansion", "Slowdown", "Recession", "Recovery"]
+REGIME_COLORS = {
+    "Expansion": C["expansion"], "Slowdown": C["slowdown"],
+    "Recession": C["recession"], "Recovery": C["recovery"],
+}
+
+# Transition probability matrix [from][to] — row-stochastic
+# Regimes persist with high probability; realistic cycle lengths
+REGIME_TRANSITIONS = {
+    "Expansion": {"Expansion": 0.88, "Slowdown": 0.10, "Recession": 0.01, "Recovery": 0.01},
+    "Slowdown":  {"Expansion": 0.08, "Slowdown": 0.78, "Recession": 0.12, "Recovery": 0.02},
+    "Recession": {"Expansion": 0.02, "Slowdown": 0.10, "Recession": 0.70, "Recovery": 0.18},
+    "Recovery":  {"Expansion": 0.22, "Slowdown": 0.05, "Recession": 0.03, "Recovery": 0.70},
+}
+
+def next_regime(current: str, rng: random.Random) -> str:
+    probs = REGIME_TRANSITIONS[current]
+    r = rng.random()
+    cumulative = 0.0
+    for regime, p in probs.items():
+        cumulative += p
+        if r < cumulative:
+            return regime
+    return current
+
+def regime_asset_bias(regime: str) -> Dict[str, float]:
+    """Return a per-asset expected-return bias (in % per period) consistent
+    with the regime — layered on top of valuation-driven expected returns."""
+    biases = {
+        "Expansion": {"Stocks": 0.30, "Bonds": -0.05, "Gold": 0.00},
+        "Slowdown":  {"Stocks": -0.10, "Bonds": 0.15, "Gold": 0.10},
+        "Recession": {"Stocks": -0.45, "Bonds": 0.35, "Gold": 0.20},
+        "Recovery":  {"Stocks": 0.25, "Bonds": 0.05, "Gold": 0.05},
+    }
+    return biases[regime]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ASSET VALUATION LAYER
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class StockValuation:
+    earnings: float          # index-level earnings (e.g. 5.5 means P/E ≈ 18 at price 100)
+    earnings_growth: float   # annual rate in %, e.g. 5.0
+
+    @property
+    def pe_ratio(self) -> float:
+        return 100.0 / self.earnings if self.earnings > 0 else 999.0
+
+    def expected_return_pct(self) -> float:
+        """Earnings yield + growth rate — classic Gordon Growth proxy."""
+        earnings_yield = (self.earnings / 100.0) * 100.0  # in %
+        return earnings_yield + self.earnings_growth
+
+    def is_expensive(self) -> bool:
+        return self.pe_ratio > 25
+
+    def is_cheap(self) -> bool:
+        return self.pe_ratio < 14
+
+    def update(self, price: float, gdp_growth: float, rng: random.Random):
+        """Earnings drift with GDP + noise each period."""
+        growth_factor = 1.0 + (gdp_growth / 100.0) * 0.4 + rng.gauss(0, 0.008)
+        self.earnings = max(0.5, self.earnings * growth_factor)
+        self.earnings_growth = max(-5.0, min(15.0,
+            self.earnings_growth * 0.95 + gdp_growth * 0.3 + rng.gauss(0, 0.3)))
+
+
+@dataclass
+class BondValuation:
+    yield_pct: float     # current yield in %
+    duration: float      # modified duration in years
+
+    def expected_return_pct(self) -> float:
+        """For bonds: yield is the expected return (ignoring roll-down)."""
+        return self.yield_pct
+
+    def price_sensitivity(self, rate_change_pct: float) -> float:
+        """Approx price change from duration: ΔP ≈ -D * Δy."""
+        return -self.duration * rate_change_pct
+
+    def update(self, interest_rate: float, inflation: float, rng: random.Random):
+        """Yield tracks policy rate + inflation premium + noise."""
+        target_yield = interest_rate + max(0, inflation - 2.0) * 0.25
+        self.yield_pct = self.yield_pct * 0.92 + target_yield * 0.08 + rng.gauss(0, 0.06)
+        self.yield_pct = max(0.1, self.yield_pct)
+
+
+@dataclass
+class GoldValuation:
+    inflation_sensitivity: float  # multiplier: how strongly gold reacts to inflation
+
+    def expected_return_pct(self, inflation: float, real_rate: float) -> float:
+        """Gold expected return: inflation hedge minus opportunity cost of real rates."""
+        return self.inflation_sensitivity * max(0, inflation - 2.0) - real_rate * 0.5
+
+    def update(self, rng: random.Random):
+        self.inflation_sensitivity = max(0.3, min(1.5,
+            self.inflation_sensitivity + rng.gauss(0, 0.01)))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MACRO ENVIRONMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+SENTIMENT_LEVELS = ["Very Bearish", "Bearish", "Neutral", "Bullish", "Very Bullish"]
+SENTIMENT_SCORE  = {"Very Bearish": -2, "Bearish": -1, "Neutral": 0, "Bullish": 1, "Very Bullish": 2}
 
 @dataclass
 class MacroEnvironment:
-    """
-    Snapshot of the macroeconomic environment at a given simulation period.
+    inflation: float
+    interest_rate: float
+    gdp_growth: float
+    oil_shock: float
+    sentiment: str
+    regime: str = "Expansion"
 
-    This is the shared 'world state' that every agent observes before making
-    a decision. Agents do not see each other's portfolios directly — they
-    only see this environment plus current asset prices/returns, which is
-    a reasonable simplification of how real-world participants act on
-    public macro signals plus observed price action.
-    """
-    inflation: float          # in percent, e.g. 2.0 means 2%
-    interest_rate: float      # in percent
-    gdp_growth: float         # in percent, can be negative (recession)
-    oil_shock: float          # in percent change applied to oil-sensitive logic
-    sentiment: str            # one of SENTIMENT_LEVELS
+    @property
+    def real_rate(self) -> float:
+        return self.interest_rate - self.inflation
 
-    def is_recession(self) -> bool:
-        """A simple recession heuristic: two consecutive quarters of contraction
-        is the textbook definition; here we use a single negative-growth read
-        as a simplifying proxy since this is a per-period macro snapshot."""
-        return self.gdp_growth < 0
+    def is_recession(self):   return self.gdp_growth < 0
+    def is_high_inflation(self): return self.inflation > 5.0
+    def is_high_rates(self):  return self.interest_rate > 5.0
+    def is_oil_crisis(self):  return self.oil_shock > 15.0
 
-    def is_high_inflation(self) -> bool:
-        return self.inflation > 5.0
-
-    def is_high_rates(self) -> bool:
-        return self.interest_rate > 5.0
-
-    def is_oil_crisis(self) -> bool:
-        return self.oil_shock > 15.0
-
-
-SENTIMENT_LEVELS = ["Very Bearish", "Bearish", "Neutral", "Bullish", "Very Bullish"]
-SENTIMENT_SCORE = {  # maps qualitative sentiment to a numeric score in [-2, 2]
-    "Very Bearish": -2,
-    "Bearish": -1,
-    "Neutral": 0,
-    "Bullish": 1,
-    "Very Bullish": 2,
-}
-
+# ══════════════════════════════════════════════════════════════════════════════
+# ASSET
+# ══════════════════════════════════════════════════════════════════════════════
 
 class Asset:
-    """
-    A single tradeable instrument (Stocks, Bonds, or Gold).
-
-    Each asset tracks its own price history and the per-period demand
-    pressure exerted on it by all agents combined. Price formation uses a
-    deliberately simple, transparent linear-impact model:
-
-        price_change_pct = demand_pressure * sensitivity_coefficient
-
-    This is not meant to be a microstructure-accurate order book model.
-    It is meant to make the link between agent behavior and price outcomes
-    legible to the user — the entire point of the "digital twin" framing
-    is that you can trace *why* a price moved back to *which agent* moved it.
-    """
-
     def __init__(self, name: str, start_price: float, sensitivity: float, base_volatility: float):
         self.name = name
-        self.sensitivity = sensitivity            # how reactive price is to demand pressure
-        self.base_volatility = base_volatility     # idiosyncratic noise term (per period, in %)
+        self.sensitivity = sensitivity
+        self.base_volatility = base_volatility
         self.price_history: List[float] = [start_price]
         self.demand_pressure_history: List[float] = [0.0]
 
@@ -272,26 +292,12 @@ class Asset:
     def price(self) -> float:
         return self.price_history[-1]
 
-    def apply_demand(self, demand_pressure: float, rng: random.Random) -> float:
-        """
-        Update the asset price given net demand pressure from all agents.
-
-        demand_pressure is a unitless net-buy-minus-sell signal, roughly in
-        [-1, 1] in normal conditions (it can exceed that under extreme
-        scenario shocks, which is intentional — crises produce fat tails).
-
-        Returns the realized percentage price change for this period.
-        """
+    def apply_demand(self, demand_pressure: float, rng: random.Random,
+                     regime_bias: float = 0.0) -> float:
         noise = rng.gauss(0, self.base_volatility)
-        pct_change = demand_pressure * self.sensitivity + noise
-        # Cap per-period moves at [-8%, +8%] — large enough to register a
-        # clear "crisis period" or "melt-up period" but small enough that
-        # even several consecutive extreme periods compound to a severe-but-
-        # plausible drawdown/rally rather than a mathematically degenerate
-        # price level over a 100-250 period run.
-        pct_change = max(min(pct_change, 8.0), -8.0)
-        new_price = self.price * (1 + pct_change / 100.0)
-        new_price = max(new_price, 0.01)
+        pct_change = demand_pressure * self.sensitivity + noise + regime_bias
+        pct_change = max(min(pct_change, 9.0), -9.0)
+        new_price = max(self.price * (1 + pct_change / 100.0), 0.01)
         self.price_history.append(new_price)
         self.demand_pressure_history.append(demand_pressure)
         return pct_change
@@ -301,51 +307,26 @@ class Asset:
             return 0.0
         return (self.price_history[-1] / self.price_history[0] - 1) * 100.0
 
-
-# ==================================================================================
-# AGENTS
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# ORDER
+# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class AgentOrder:
-    """
-    The result of one agent's decision process for one period: how much it
-    wants to change its allocation to each asset, plus a human-readable
-    rationale string used to populate the transparent rule log.
-    """
     agent_name: str
-    allocation_deltas: Dict[str, float]   # e.g. {"Stocks": -0.05, "Bonds": +0.05, "Cash": 0.0}
-    rationale: List[str]                   # list of triggered-rule descriptions
+    allocation_deltas: Dict[str, float]
+    rationale: List[str]
 
+# ══════════════════════════════════════════════════════════════════════════════
+# BASE AGENT
+# ══════════════════════════════════════════════════════════════════════════════
 
 class Agent:
-    """
-    Abstract base class for all market participants.
-
-    Subclasses implement `decide()`, which inspects the MacroEnvironment and
-    recent asset performance and returns an AgentOrder describing how the
-    agent wants to shift its allocation this period. The base class handles
-    the bookkeeping common to all agents: tracking allocation history and
-    converting allocation changes into portfolio value and demand pressure.
-    """
-
     name: str = "Agent"
-    color: str = "#888888"
-
-    # Per-asset (min, max) allocation bounds. Subclasses override this to
-    # reflect realistic mandate constraints — e.g. a pension fund cannot run
-    # away to -300% bonds, and a hedge fund's leverage is capped. Without
-    # bounds, small per-period rule triggers compound over 100 periods into
-    # economically meaningless allocations (and prices that explode/collapse
-    # to nonsense), since the same rule can keep firing every period a
-    # condition persists (e.g. "bullish sentiment" lasting 30 periods in a
-    # row).
+    color: str = "#888"
     allocation_bounds: Dict[str, tuple] = {}
 
     def __init__(self, starting_allocation: Dict[str, float], starting_capital: float = 100.0):
-        # Allocation is expressed as weights that can exceed 100% (leverage)
-        # or go negative (shorting / negative cash, i.e. borrowing), but is
-        # always clamped to allocation_bounds to keep the simulation realistic.
         self.starting_allocation = dict(starting_allocation)
         self.allocation_history: List[Dict[str, float]] = [dict(starting_allocation)]
         self.capital = starting_capital
@@ -356,414 +337,451 @@ class Agent:
     def current_allocation(self) -> Dict[str, float]:
         return self.allocation_history[-1]
 
-    def decide(self, env: MacroEnvironment, market: "Market", period: int) -> AgentOrder:
-        """Must be implemented by subclasses. Returns an AgentOrder."""
-        raise NotImplementedError
+    def _clamp(self, asset: str, v: float) -> float:
+        lo, hi = self.allocation_bounds.get(asset, (-3.0, 3.0))
+        return max(lo, min(hi, v))
 
-    def _clamp(self, asset_name: str, value: float) -> float:
-        lo, hi = self.allocation_bounds.get(asset_name, (-3.0, 3.0))
-        return max(lo, min(hi, value))
-
-    def _move_toward(self, deltas: Dict[str, float], asset_name: str, target: float, speed: float):
-        """
-        Nudge `asset_name`'s allocation a fraction (`speed`) of the way from
-        its CURRENT level toward `target`, and record the resulting delta in
-        `deltas` (additively, so multiple rules touching the same asset in
-        one decide() call combine sensibly).
-
-        This is the key negative-feedback mechanism that keeps the
-        simulation well-behaved: a rule that fires every period a condition
-        holds (e.g. "sentiment stays bearish for 40 periods straight") does
-        NOT keep pushing allocation by a constant amount forever — the move
-        shrinks as the agent approaches its target and stops once it
-        arrives, exactly like a real allocator adjusting toward a desired
-        position rather than trading in one direction indefinitely.
-        """
-        current = self.current_allocation.get(asset_name, 0.0) + deltas.get(asset_name, 0.0)
+    def _move_toward(self, deltas: Dict, asset: str, target: float, speed: float) -> float:
+        current = self.current_allocation.get(asset, 0.0) + deltas.get(asset, 0.0)
         delta = (target - current) * speed
-        deltas[asset_name] = deltas.get(asset_name, 0.0) + delta
+        deltas[asset] = deltas.get(asset, 0.0) + delta
         return delta
 
     def apply_order(self, order: AgentOrder):
-        """Apply the allocation deltas to produce this period's new allocation,
-        clamped to this agent's realistic mandate bounds. Clamping is what
-        keeps a persistent rule trigger (e.g. 30 bullish periods in a row)
-        from compounding into an unbounded allocation."""
         new_alloc = dict(self.current_allocation)
-        for asset_name, delta in order.allocation_deltas.items():
-            raw = new_alloc.get(asset_name, 0.0) + delta
-            new_alloc[asset_name] = self._clamp(asset_name, raw)
+        for asset, delta in order.allocation_deltas.items():
+            new_alloc[asset] = self._clamp(asset, new_alloc.get(asset, 0.0) + delta)
         self.allocation_history.append(new_alloc)
         self.trade_log.append(order)
 
     def update_portfolio_value(self, asset_returns_pct: Dict[str, float]):
-        """
-        Mark the agent's portfolio to market using this period's asset
-        returns and its allocation weights *prior* to this period's trade
-        (i.e. the allocation it held going into the period).
-        """
-        prior_alloc = self.allocation_history[-2] if len(self.allocation_history) >= 2 else self.starting_allocation
-        period_return = 0.0
-        for asset_name, weight in prior_alloc.items():
-            if asset_name == "Cash":
-                continue
-            r = asset_returns_pct.get(asset_name, 0.0) / 100.0
-            period_return += weight * r
-        new_value = self.portfolio_value_history[-1] * (1 + period_return)
-        self.portfolio_value_history.append(new_value)
+        prior = self.allocation_history[-2] if len(self.allocation_history) >= 2 else self.starting_allocation
+        period_return = sum(
+            w * asset_returns_pct.get(a, 0.0) / 100.0
+            for a, w in prior.items() if a not in ("Cash",)
+        )
+        self.portfolio_value_history.append(self.portfolio_value_history[-1] * (1 + period_return))
 
-    def demand_for(self, asset_name: str, last_order: AgentOrder) -> float:
-        """How much net buy/sell pressure this agent exerted on a given asset
-        this period, used by the Market to aggregate total demand pressure."""
-        return last_order.allocation_deltas.get(asset_name, 0.0)
+    def decide(self, env: MacroEnvironment, market: "Market", period: int) -> AgentOrder:
+        raise NotImplementedError
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PENSION FUND
+# ══════════════════════════════════════════════════════════════════════════════
 
 class PensionFund(Agent):
     """
-    Long-horizon, risk-averse, fundamentally-driven allocator.
-
-    Behavioral rules (transparent, deliberately simple):
-      - High inflation  -> increase bond allocation (seeking real-yield protection
-        is debatable in real markets, but the simplifying convention here is
-        "inflation triggers a flight to duration-matched safety," which is how
-        pension funds often behave even if it is not always optimal).
-      - Weak GDP growth -> reduce equities (de-risking ahead of earnings downturns).
-      - Large equity drawdown -> buys the dip (contrarian, long-horizon rebalancing).
-      - Elevated equity valuations after a strong rally -> trims equities
-        (rebalancing discipline, "sells when valuations become excessive").
+    Liability-driven investor. Allocation is shaped by:
+      · Funding ratio (assets / liabilities) — must be managed above 100%
+      · Liability duration — must be matched with sufficient bond exposure
+      · Required return — equity only pulled in when yield gap exists
     """
 
     name = "Pension Fund"
-    color = COLORS["pension"]
-    # A pension fund's mandate keeps it long-only and modestly diversified;
-    # it can tilt meaningfully toward bonds/gold but never gets close to a
-    # hedge-fund-style leverage profile.
+    color = C["pension"]
     allocation_bounds = {
-        "Stocks": (0.10, 0.65),
-        "Bonds": (0.25, 0.75),
-        "Gold": (0.0, 0.30),
+        "Stocks": (0.05, 0.70),
+        "Bonds":  (0.20, 0.80),
+        "Gold":   (0.00, 0.25),
     }
 
-    def __init__(self):
+    def __init__(self, liability_duration: float = 12.0, required_return_pct: float = 5.5):
         super().__init__({"Stocks": 0.40, "Bonds": 0.50, "Gold": 0.10})
+        self.liabilities = 95.0          # start slightly underfunded (realistic)
+        self.liability_duration = liability_duration
+        self.required_return_pct = required_return_pct
+        self.funding_ratio_history: List[float] = []
+
+    @property
+    def funding_ratio(self) -> float:
+        assets = self.portfolio_value_history[-1] if self.portfolio_value_history else 100.0
+        return assets / self.liabilities * 100.0
+
+    def update_liabilities(self, interest_rate: float):
+        """Liabilities are discounted at the prevailing rate; falling rates
+        increase the PV of liabilities (the classic pension duration problem)."""
+        discount_change = -(interest_rate - 4.0) * 0.01 * self.liability_duration
+        self.liabilities *= (1.0 + discount_change / 100.0)
+        self.liabilities = max(50.0, self.liabilities)
 
     def decide(self, env: MacroEnvironment, market: "Market", period: int) -> AgentOrder:
         deltas: Dict[str, float] = {}
         rationale: List[str] = []
-        base_stocks, base_bonds, base_gold = 0.40, 0.50, 0.10
 
-        # Each rule below sets a TARGET allocation and moves a fraction of
-        # the way toward it each period (see Agent._move_toward). This
-        # means a persistent condition (e.g. inflation staying above 5% for
-        # 40 periods straight) pulls the portfolio toward, and then holds
-        # it at, a new equilibrium — rather than pushing it the same amount
-        # every single period forever, which would compound to nonsense.
+        self.update_liabilities(env.interest_rate)
+        fr = self.funding_ratio
+        self.funding_ratio_history.append(fr)
 
-        # Rule 1: inflation hedge — target a higher bond / lower equity mix
+        bond_val: BondValuation = market.valuations["Bonds"]
+        stock_val: StockValuation = market.valuations["Stocks"]
+        gold_val: GoldValuation = market.valuations["Gold"]
+
+        exp_stock  = stock_val.expected_return_pct() + regime_asset_bias(env.regime)["Stocks"]
+        exp_bond   = bond_val.expected_return_pct()
+        exp_gold   = gold_val.expected_return_pct(env.inflation, env.real_rate)
+
+        # — Funding ratio drives the primary risk dial —
+        if fr < 90:
+            self._move_toward(deltas, "Bonds", 0.70, 0.18)
+            self._move_toward(deltas, "Stocks", 0.15, 0.18)
+            rationale.append(f"CRITICAL: Funding ratio {fr:.1f}% < 90% — emergency de-risking, maximise bond matching")
+        elif fr < 100:
+            self._move_toward(deltas, "Bonds", 0.62, 0.12)
+            self._move_toward(deltas, "Stocks", 0.28, 0.12)
+            rationale.append(f"Funding ratio {fr:.1f}% < 100% — increasing bond allocation, reducing equity risk")
+        elif fr > 120:
+            self._move_toward(deltas, "Stocks", 0.55, 0.10)
+            self._move_toward(deltas, "Bonds", 0.38, 0.10)
+            rationale.append(f"Funding ratio {fr:.1f}% > 120% — surplus allows higher return-seeking equity allocation")
+
+        # — Expected-return overlay: is equity worth the risk? —
+        yield_gap = exp_stock - exp_bond
+        if yield_gap < 1.5 and fr < 110:
+            self._move_toward(deltas, "Bonds", 0.58, 0.08)
+            self._move_toward(deltas, "Stocks", 0.32, 0.08)
+            rationale.append(f"Equity–bond yield gap {yield_gap:.1f}pp too narrow — not compensated for equity risk, trim equities")
+        elif yield_gap > 5.0:
+            self._move_toward(deltas, "Stocks", 0.52, 0.09)
+            rationale.append(f"Equity–bond yield gap {yield_gap:.1f}pp wide — adding equities vs bonds")
+
+        # — Inflation hedge —
         if env.is_high_inflation():
-            self._move_toward(deltas, "Bonds", target=0.62, speed=0.12)
-            self._move_toward(deltas, "Stocks", target=0.28, speed=0.12)
-            rationale.append(f"Inflation {env.inflation:.1f}% > 5% threshold → drifting toward higher bond allocation")
+            self._move_toward(deltas, "Gold", min(0.22, exp_gold / 20.0 + 0.12), 0.10)
+            rationale.append(f"Inflation {env.inflation:.1f}% > 5% — adding gold as liability hedge")
 
-        # Rule 2: weak growth -> target lower equities
-        if env.gdp_growth < 1.0:
-            self._move_toward(deltas, "Stocks", target=0.30, speed=0.10)
-            self._move_toward(deltas, "Bonds", target=0.58, speed=0.10)
-            rationale.append(f"GDP growth {env.gdp_growth:.1f}% weak (<1%) → drifting toward reduced equity exposure")
+        # — Regime overlay —
+        if env.regime == "Recession":
+            self._move_toward(deltas, "Bonds", 0.65, 0.10)
+            self._move_toward(deltas, "Stocks", 0.22, 0.10)
+            rationale.append(f"Regime = Recession → defensive shift (bonds ↑, equities ↓)")
+        elif env.regime == "Recovery" and fr > 105:
+            self._move_toward(deltas, "Stocks", 0.50, 0.08)
+            rationale.append(f"Regime = Recovery + comfortable funding → add equities")
 
-        # Rule 3: contrarian buy-the-dip after a sharp stock drawdown
-        recent_stock_return = market.recent_return("Stocks", lookback=5)
-        if recent_stock_return < -8.0:
-            self._move_toward(deltas, "Stocks", target=0.55, speed=0.15)
-            self._move_toward(deltas, "Bonds", target=0.35, speed=0.15)
-            rationale.append(f"Stocks down {recent_stock_return:.1f}% over 5 periods → contrarian buy, drifting toward higher equities")
+        # — Contrarian rebalancing within mandate —
+        recent_stock = market.recent_return("Stocks", 5)
+        if recent_stock < -8.0 and fr > 100:
+            self._move_toward(deltas, "Stocks", 0.52, 0.14)
+            rationale.append(f"Stocks down {recent_stock:.1f}% (5p) and funding ratio healthy — contrarian buy-the-dip")
+        elif recent_stock > 14.0:
+            self._move_toward(deltas, "Stocks", 0.34, 0.10)
+            rationale.append(f"Stocks up {recent_stock:.1f}% (5p) — rebalancing discipline, trimming elevated equities")
 
-        # Rule 4: trim equities after a large rally (valuation discipline)
-        elif recent_stock_return > 15.0:
-            self._move_toward(deltas, "Stocks", target=0.32, speed=0.12)
-            self._move_toward(deltas, "Gold", target=0.22, speed=0.12)
-            rationale.append(f"Stocks up {recent_stock_return:.1f}% over 5 periods → valuations excessive, trimming equities")
-
-        # Rule 5: oil crisis -> modest flight to gold as a real-asset hedge
-        if env.is_oil_crisis():
-            self._move_toward(deltas, "Gold", target=0.22, speed=0.08)
-            self._move_toward(deltas, "Stocks", target=0.33, speed=0.08)
-            rationale.append(f"Oil shock {env.oil_shock:.1f}% → modest reallocation toward gold")
-
-        # Rule 6 (default / mean reversion): absent any active signal, drift
-        # gently back toward the strategic 40/50/10 policy mix — this is
-        # what gives a pension fund its long-horizon, anchor-like character.
+        # — Mean reversion to 40/50/10 policy when no signal —
         if not rationale:
-            self._move_toward(deltas, "Stocks", target=base_stocks, speed=0.06)
-            self._move_toward(deltas, "Bonds", target=base_bonds, speed=0.06)
-            self._move_toward(deltas, "Gold", target=base_gold, speed=0.06)
-            rationale.append("No threshold breached → drifting back toward strategic 40/50/10 policy mix")
+            self._move_toward(deltas, "Stocks", 0.40, 0.05)
+            self._move_toward(deltas, "Bonds", 0.50, 0.05)
+            self._move_toward(deltas, "Gold",  0.10, 0.05)
+            rationale.append("No active signal — drifting back to strategic 40/50/10 policy mix")
 
         return AgentOrder(self.name, deltas, rationale)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# HEDGE FUND
+# ══════════════════════════════════════════════════════════════════════════════
 
 class HedgeFund(Agent):
     """
-    Momentum-driven, leveraged, trend-following allocator.
-
-    Behavioral rules:
-      - Stocks rising -> increase (leveraged) stock exposure, chasing the trend.
-      - Stocks falling -> reduce exposure or actively short ("shorts weak assets").
-      - Bullish sentiment -> add leverage.
-      - Recession or oil crisis -> rotate toward gold as a tactical hedge,
-        consistent with "chases trends" applied to commodities too.
+    Multi-signal alpha-seeker: trend + valuation + risk-budget.
+    Tracks gross exposure, net exposure, leverage ratio.
     """
 
     name = "Hedge Fund"
-    color = COLORS["hedge"]
-    # Hedge funds run leverage (stock weight > 100%, cash negative i.e.
-    # borrowed) but real-world prime-broker margin limits cap how far that
-    # can run. -50% stocks represents an aggressive net-short stance.
+    color = C["hedge"]
     allocation_bounds = {
-        "Stocks": (-0.50, 1.80),
-        "Cash": (-0.80, 0.30),
-        "Gold": (0.0, 0.40),
-        "Bonds": (0.0, 0.30),
+        "Stocks": (-0.60, 2.00),
+        "Cash":   (-1.00, 0.40),
+        "Gold":   (0.00,  0.50),
+        "Bonds":  (0.00,  0.35),
     }
 
-    def __init__(self):
+    def __init__(self, risk_budget_vol: float = 0.12):
         super().__init__({"Stocks": 1.20, "Cash": -0.20})
+        self.risk_budget_vol = risk_budget_vol   # target annualised vol
+        self.gross_exposure_history: List[float] = [1.40]
+        self.net_exposure_history:   List[float] = [1.20]
+        self.leverage_ratio_history: List[float] = [1.40]
+        self.trend_signal_history:   List[float] = [0.0]
+        self.valuation_signal_history: List[float] = [0.0]
+
+    def _trend_signal(self, market: "Market") -> float:
+        """Composite trend: smoothed momentum over 6 periods, normalised to [-1,1]."""
+        mom = market.smoothed_momentum("Stocks", lookback=6)
+        return max(-1.0, min(1.0, mom / 3.0))
+
+    def _valuation_signal(self, market: "Market") -> float:
+        """Valuation signal: -1 = very expensive, +1 = very cheap."""
+        sv: StockValuation = market.valuations["Stocks"]
+        pe = sv.pe_ratio
+        # Fair PE ≈ 18; above 24 is extreme rich, below 12 is extreme cheap
+        z = (pe - 18.0) / 6.0
+        return max(-1.5, min(1.5, -z))   # negative because high PE = expensive = bearish signal
 
     def decide(self, env: MacroEnvironment, market: "Market", period: int) -> AgentOrder:
         deltas: Dict[str, float] = {}
         rationale: List[str] = []
-        base_stocks, base_cash = 1.20, -0.20
 
-        # Use a smoothed momentum signal (average per-period return over the
-        # last 6 periods) rather than a raw point-to-point comparison, so a
-        # single noisy down-period near a peak doesn't immediately look like
-        # a trend reversal — real momentum desks confirm a trend over
-        # multiple observations before flipping a leveraged position.
-        recent_stock_return = market.smoothed_momentum("Stocks", lookback=6)
+        trend     = self._trend_signal(market)
+        valuation = self._valuation_signal(market)
+        self.trend_signal_history.append(trend)
+        self.valuation_signal_history.append(valuation)
+
+        sv: StockValuation = market.valuations["Stocks"]
         sentiment_score = SENTIMENT_SCORE.get(env.sentiment, 0)
 
-        # Combine momentum + sentiment into a single target stock weight,
-        # then move toward it. Using one target (rather than several
-        # competing additive deltas) avoids rules fighting each other every
-        # period and gives a clean, bounded equilibrium for any persistent
-        # regime — exactly the "chases trends, uses leverage" character of
-        # a momentum hedge fund, but one that settles rather than runs away.
-        target_stocks = base_stocks
-        if recent_stock_return > 1.5:
-            target_stocks = 1.50
-            rationale.append(f"Stock momentum +{recent_stock_return:.2f}%/period (6-period avg) → target increased leveraged exposure")
-        elif recent_stock_return < -1.5:
-            target_stocks = 0.70
-            rationale.append(f"Stock momentum {recent_stock_return:.2f}%/period (6-period avg) → target cut exposure / shift toward shorting weak assets")
+        # — Core signal combination —
+        signal_agree = (trend > 0 and valuation > 0) or (trend < 0 and valuation < 0)
+        signal_conflict = abs(trend - valuation) > 1.2
 
+        # Start from a neutral 1.0x long
+        target_stocks = 1.0
+
+        if signal_agree and trend > 0.3:
+            target_stocks = 1.60 + 0.25 * min(trend, 1.0)
+            rationale.append(f"Trend ({trend:+.2f}) & valuation ({valuation:+.2f}) aligned BULLISH → increase leveraged long")
+        elif signal_agree and trend < -0.3:
+            target_stocks = 0.30 - 0.25 * min(abs(trend), 1.0)
+            rationale.append(f"Trend ({trend:+.2f}) & valuation ({valuation:+.2f}) aligned BEARISH → cut / short equities")
+        elif signal_conflict and trend > 0.4:
+            # Trend positive but overvalued → smaller position
+            target_stocks = 1.15
+            rationale.append(f"Trend positive ({trend:+.2f}) but valuation extreme ({valuation:+.2f}) → reduced long, size discipline")
+        elif signal_conflict and trend < -0.4:
+            target_stocks = 0.65
+            rationale.append(f"Trend negative ({trend:+.2f}) but valuation cheap ({valuation:+.2f}) → partial de-risk, not full short")
+        else:
+            rationale.append(f"Mixed signals (trend={trend:+.2f}, val={valuation:+.2f}) → hold near-neutral positioning")
+
+        # — Sentiment overlay —
         if sentiment_score >= 1:
-            target_stocks += 0.12 * sentiment_score
-            rationale.append(f"Sentiment '{env.sentiment}' → target additional leverage")
+            target_stocks += 0.10 * sentiment_score
+            rationale.append(f"Sentiment '{env.sentiment}' → add leverage")
         elif sentiment_score <= -1:
-            target_stocks -= 0.15 * abs(sentiment_score)
-            rationale.append(f"Sentiment '{env.sentiment}' → target de-risking")
+            target_stocks -= 0.12 * abs(sentiment_score)
+            rationale.append(f"Sentiment '{env.sentiment}' → de-risk")
 
+        # — Risk budget: estimate realised vol from recent stock returns —
+        recent_prices = market.assets["Stocks"].price_history[-12:]
+        if len(recent_prices) > 3:
+            rets = [(recent_prices[i]/recent_prices[i-1]-1) for i in range(1,len(recent_prices))]
+            realised_vol = (np.std(rets) * math.sqrt(52)) if rets else 0.15
+            # Scale position down if realised vol exceeds risk budget
+            vol_scale = min(1.0, self.risk_budget_vol / max(realised_vol, 0.04))
+            target_stocks *= vol_scale
+            if vol_scale < 0.85:
+                rationale.append(f"Realised vol {realised_vol*100:.1f}% ann. > risk budget — scaling positions by {vol_scale:.2f}x")
+
+        # — Rate / regime overrides —
         if env.is_high_rates():
             target_stocks -= 0.15
-            rationale.append(f"Interest rate {env.interest_rate:.1f}% > 5% → target deleveraging (higher financing cost)")
+            rationale.append(f"Rates {env.interest_rate:.1f}% > 5% → reduce financing cost exposure")
+        if env.regime == "Recession":
+            target_stocks = min(target_stocks, 0.50)
+            rationale.append("Regime = Recession → cap gross long exposure")
 
-        target_stocks = max(self.allocation_bounds["Stocks"][0], min(self.allocation_bounds["Stocks"][1], target_stocks))
-        # Speed governs how much of the gap to the target is closed in one
-        # period. 0.12 means a full momentum reversal (e.g. target swinging
-        # from 1.65 to 0.20) plays out over several periods rather than as a
-        # single violent reallocation — consistent with even aggressive
-        # funds unwinding leveraged positions over days/weeks, not instantly.
-        speed = 0.08
-        self._move_toward(deltas, "Stocks", target=target_stocks, speed=speed)
-        # Cash is the financing leg: it moves opposite to stocks 1:1 so that
-        # leverage (stocks > 100%) is funded by negative cash (borrowing).
+        target_stocks = float(np.clip(target_stocks,
+            self.allocation_bounds["Stocks"][0], self.allocation_bounds["Stocks"][1]))
+
+        self._move_toward(deltas, "Stocks", target_stocks, 0.10)
         deltas["Cash"] = deltas.get("Cash", 0.0) - deltas.get("Stocks", 0.0)
 
-        # Tactical gold rotation during recession / oil crisis — kept as a
-        # separate small target-seeking move on a different asset so it
-        # doesn't interact with the stocks/cash financing pair above.
-        if env.is_recession() or env.is_oil_crisis():
-            self._move_toward(deltas, "Gold", target=0.30, speed=0.12)
-            trigger = "Recession" if env.is_recession() else "Oil crisis"
-            rationale.append(f"{trigger} detected → tactical rotation into gold")
+        # — Tactical gold in stress regimes —
+        if env.is_recession() or env.is_oil_crisis() or env.regime == "Recession":
+            self._move_toward(deltas, "Gold", 0.30, 0.12)
+            rationale.append("Recession/oil crisis → tactical gold allocation")
         else:
-            self._move_toward(deltas, "Gold", target=0.0, speed=0.08)
+            self._move_toward(deltas, "Gold", 0.0, 0.09)
+
+        # — Track exposure metrics —
+        new_stocks = float(np.clip(
+            self.current_allocation.get("Stocks", 1.2) + deltas.get("Stocks", 0.0),
+            self.allocation_bounds["Stocks"][0], self.allocation_bounds["Stocks"][1]))
+        new_gold   = float(np.clip(
+            self.current_allocation.get("Gold", 0.0) + deltas.get("Gold", 0.0),
+            0.0, 0.5))
+        gross = abs(new_stocks) + abs(new_gold)
+        net   = new_stocks + new_gold
+        self.gross_exposure_history.append(gross)
+        self.net_exposure_history.append(net)
+        self.leverage_ratio_history.append(gross)
 
         if not rationale:
-            rationale.append("No momentum or sentiment signal → hold current trend position")
-
+            rationale.append("No directional signal — hold current positions")
         return AgentOrder(self.name, deltas, rationale)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# RETAIL INVESTOR
+# ══════════════════════════════════════════════════════════════════════════════
 
 class RetailInvestor(Agent):
     """
-    Emotion-driven, sentiment-following, pro-cyclical allocator.
-
-    Behavioral rules:
-      - Bullish sentiment -> buys stocks (chases winners).
-      - Bearish sentiment / drawdown -> panic sells.
-      - Recession -> sells aggressively, retreats to cash.
-      - Rising stock prices -> performance-chasing into the rally.
+    Behavioural investor driven by Fear/Greed index.
+    Strong gains compound greed; losses spike fear.
+    News sensitivity amplifies reactions.
     """
 
     name = "Retail Investor"
-    color = COLORS["retail"]
-    # Retail investors are long-only and unleveraged: they can go anywhere
-    # from "all cash, fully panicked" to "fully invested, euphoric", but
-    # cannot short or use margin in this simplified model.
+    color = C["retail"]
     allocation_bounds = {
         "Stocks": (0.0, 1.0),
-        "Cash": (0.0, 1.0),
-        "Bonds": (0.0, 0.20),
-        "Gold": (0.0, 0.20),
+        "Cash":   (0.0, 1.0),
+        "Bonds":  (0.0, 0.15),
+        "Gold":   (0.0, 0.15),
     }
 
-    def __init__(self):
+    def __init__(self, news_sensitivity: float = 1.2):
         super().__init__({"Stocks": 0.80, "Cash": 0.20})
+        self.fear  = 20.0   # 0–100; higher = more fearful
+        self.greed = 60.0   # 0–100
+        self.news_sensitivity = news_sensitivity   # amplifier on sentiment signals
+        self.fear_history:  List[float] = [20.0]
+        self.greed_history: List[float] = [60.0]
+
+    def _update_fear_greed(self, recent_3: float, recent_5: float, sentiment: str):
+        """Fear and greed evolve from price action and sentiment, then decay."""
+        s = SENTIMENT_SCORE.get(sentiment, 0)
+        # Greed increases with gains and bullish sentiment
+        self.greed += (max(0, recent_3) * 2.5 + max(0, s) * 6) * self.news_sensitivity
+        self.greed -= (max(0, -recent_3) * 1.5 + max(0, -s) * 3) * self.news_sensitivity
+        self.greed = float(np.clip(self.greed, 0, 100))
+        # Fear increases with losses and bearish sentiment
+        self.fear += (max(0, -recent_5) * 3.0 + max(0, -s) * 7) * self.news_sensitivity
+        self.fear -= (max(0, recent_5) * 1.2 + max(0, s) * 3) * self.news_sensitivity
+        self.fear = float(np.clip(self.fear, 0, 100))
+        # Mean-revert slightly each period
+        self.greed = self.greed * 0.90 + 50 * 0.10
+        self.fear  = self.fear  * 0.90 + 30 * 0.10
 
     def decide(self, env: MacroEnvironment, market: "Market", period: int) -> AgentOrder:
         deltas: Dict[str, float] = {}
         rationale: List[str] = []
-        base_stocks = 0.80
 
-        sentiment_score = SENTIMENT_SCORE.get(env.sentiment, 0)
-        recent_stock_return_3 = market.recent_return("Stocks", lookback=3)
-        recent_stock_return_5 = market.recent_return("Stocks", lookback=5)
+        r3 = market.recent_return("Stocks", 3)
+        r5 = market.recent_return("Stocks", 5)
+        self._update_fear_greed(r3, r5, env.sentiment)
+        self.fear_history.append(self.fear)
+        self.greed_history.append(self.greed)
 
-        # As with the Hedge Fund, all signals are blended into one target
-        # stock weight and the agent moves a fraction of the way toward it
-        # each period. This produces the right qualitative behavior — buy
-        # winners, panic-sell drawdowns, chase rallies — without a
-        # persistent signal (e.g. 30 periods of "Bearish" sentiment in a
-        # row) causing stock weight to run past 0% or compound the price
-        # into an unrealistic spiral.
-        target_stocks = base_stocks
+        # Net Fear/Greed composite: positive = greedy, negative = fearful
+        fg_score = (self.greed - self.fear) / 50.0   # roughly [-2, +2]
 
-        if sentiment_score >= 1:
-            target_stocks += 0.10 * sentiment_score
-            rationale.append(f"Sentiment '{env.sentiment}' → target buying winners, higher stock weight")
-        elif sentiment_score <= -1:
-            target_stocks -= 0.18 * abs(sentiment_score)
-            rationale.append(f"Sentiment '{env.sentiment}' → target panic reduction in stock weight")
+        target_stocks = 0.80
 
-        if recent_stock_return_3 > 5.0:
-            target_stocks += 0.10
-            rationale.append(f"Stocks up {recent_stock_return_3:.1f}% (3-period) → target performance-chasing, higher stock weight")
+        if fg_score > 0.8:
+            target_stocks = 0.90 + 0.05 * min(fg_score, 2.0)
+            rationale.append(f"Greed index {self.greed:.0f} >> Fear {self.fear:.0f} → euphoric buying, chasing performance")
+        elif fg_score > 0.3:
+            target_stocks = 0.85
+            rationale.append(f"Net Greed ({fg_score:+.1f}) → mild risk-on, adding to stocks")
+        elif fg_score < -0.8:
+            target_stocks = 0.30 - 0.10 * min(abs(fg_score), 1.5)
+            rationale.append(f"Fear index {self.fear:.0f} >> Greed {self.greed:.0f} → PANIC selling, fleeing to cash")
+        elif fg_score < -0.3:
+            target_stocks = 0.60
+            rationale.append(f"Net Fear ({fg_score:+.1f}) → cautious, trimming stocks")
 
-        if recent_stock_return_5 < -6.0:
-            target_stocks -= 0.25
-            rationale.append(f"Drawdown {recent_stock_return_5:.1f}% (5-period) → target panic sell, much lower stock weight")
+        # Regime fear amplifier
+        if env.regime == "Recession":
+            target_stocks = min(target_stocks, 0.45)
+            rationale.append("Regime = Recession → further de-risking (news sensitivity amplified)")
 
-        if env.is_recession():
-            target_stocks -= 0.20
-            rationale.append(f"Recession (GDP {env.gdp_growth:.1f}%) → target aggressive de-risking to cash")
+        if r5 < -6.0:
+            target_stocks -= 0.15
+            rationale.append(f"Drawdown {r5:.1f}% (5p) → panic sell trigger (news sensitivity × {self.news_sensitivity:.1f})")
 
-        target_stocks = max(self.allocation_bounds["Stocks"][0], min(self.allocation_bounds["Stocks"][1], target_stocks))
-        speed = 0.18  # retail investors react quickly and emotionally, but not instantly
-        self._move_toward(deltas, "Stocks", target=target_stocks, speed=speed)
-        # Cash absorbs whatever stocks gave up/took — retail here is
-        # unleveraged and long-only, so cash is simply 1 - stocks.
-        deltas["Cash"] = deltas.get("Cash", 0.0) - deltas.get("Stocks", 0.0)
+        target_stocks = float(np.clip(target_stocks, 0.0, 1.0))
+        self._move_toward(deltas, "Stocks", target_stocks, 0.20)
+        deltas["Cash"] = -deltas.get("Stocks", 0.0)
 
         if not rationale:
-            rationale.append("Neutral sentiment, no strong signal → hold current position")
-
+            rationale.append(f"F/G balanced (fear={self.fear:.0f}, greed={self.greed:.0f}) → hold current allocation")
         return AgentOrder(self.name, deltas, rationale)
 
-
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # MARKET
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 class Market:
-    """
-    Owns the set of tradeable Assets and the current MacroEnvironment.
-
-    Responsible for:
-      - aggregating all agents' per-period demand into a net demand-pressure
-        figure for each asset,
-      - applying that pressure to update asset prices,
-      - exposing helper queries (like recent_return) that agents use to make
-        decisions, so all agent "perception" of the market is centralized
-        and consistent.
-    """
-
     def __init__(self, env: MacroEnvironment, seed: int = 42):
         self.env = env
         self.rng = random.Random(seed)
         self.assets: Dict[str, Asset] = {
-            "Stocks": Asset("Stocks", start_price=100.0, sensitivity=14.0, base_volatility=0.5),
-            "Bonds": Asset("Bonds", start_price=100.0, sensitivity=9.0, base_volatility=0.35),
-            "Gold": Asset("Gold", start_price=100.0, sensitivity=11.0, base_volatility=0.55),
+            "Stocks": Asset("Stocks", 100.0, sensitivity=13.0, base_volatility=0.55),
+            "Bonds":  Asset("Bonds",  100.0, sensitivity=8.5,  base_volatility=0.30),
+            "Gold":   Asset("Gold",   100.0, sensitivity=10.0, base_volatility=0.50),
+        }
+        # Valuation layer
+        self.valuations: Dict = {
+            "Stocks": StockValuation(earnings=5.5, earnings_growth=5.0),   # P/E ≈ 18
+            "Bonds":  BondValuation(yield_pct=env.interest_rate, duration=8.5),
+            "Gold":   GoldValuation(inflation_sensitivity=0.85),
         }
         self.env_history: List[MacroEnvironment] = [env]
+        self.regime_history: List[str] = [env.regime]
+        # Track per-period expected returns
+        self.expected_return_history: List[Dict[str, float]] = []
 
-    def recent_return(self, asset_name: str, lookback: int) -> float:
-        """Percent price change over the last `lookback` periods (or fewer if
-        the simulation hasn't run that long yet)."""
-        history = self.assets[asset_name].price_history
-        if len(history) < 2:
-            return 0.0
-        lb = min(lookback, len(history) - 1)
-        return (history[-1] / history[-1 - lb] - 1) * 100.0
+    def expected_returns(self, env: MacroEnvironment) -> Dict[str, float]:
+        sv: StockValuation = self.valuations["Stocks"]
+        bv: BondValuation  = self.valuations["Bonds"]
+        gv: GoldValuation  = self.valuations["Gold"]
+        bias = regime_asset_bias(env.regime)
+        return {
+            "Stocks": sv.expected_return_pct() + bias["Stocks"],
+            "Bonds":  bv.expected_return_pct() + bias["Bonds"],
+            "Gold":   gv.expected_return_pct(env.inflation, env.real_rate) + bias["Gold"],
+        }
 
-    def smoothed_momentum(self, asset_name: str, lookback: int) -> float:
-        """
-        A smoothed momentum signal: the average of the per-period returns
-        over the lookback window, rather than a single point-to-point
-        comparison. This filters out one-off noisy periods from looking
-        like a trend reversal, which is what real momentum strategies do
-        (e.g. trade on a moving average of returns, not the latest tick).
-        """
-        history = self.assets[asset_name].price_history
-        if len(history) < 3:
+    def recent_return(self, asset: str, lookback: int) -> float:
+        h = self.assets[asset].price_history
+        if len(h) < 2:
             return 0.0
-        lb = min(lookback, len(history) - 1)
-        window = history[-(lb + 1):]
-        period_returns = [
-            (window[i] / window[i - 1] - 1) * 100.0 for i in range(1, len(window))
-        ]
-        return sum(period_returns) / len(period_returns)
+        lb = min(lookback, len(h)-1)
+        return (h[-1] / h[-1-lb] - 1) * 100.0
+
+    def smoothed_momentum(self, asset: str, lookback: int) -> float:
+        h = self.assets[asset].price_history
+        if len(h) < 3:
+            return 0.0
+        lb = min(lookback, len(h)-1)
+        w = h[-(lb+1):]
+        rets = [(w[i]/w[i-1]-1)*100 for i in range(1, len(w))]
+        return sum(rets)/len(rets)
 
     def aggregate_demand(self, orders: List[AgentOrder]) -> Dict[str, float]:
-        """
-        Sum every agent's allocation delta for each asset to get net demand
-        pressure. This is the core "emergence" mechanism: no single agent
-        sets the price — the price change is a function of everyone's
-        combined behavior.
-        """
-        demand = {name: 0.0 for name in self.assets}
-        for order in orders:
-            for asset_name, delta in order.allocation_deltas.items():
-                if asset_name in demand:
-                    demand[asset_name] += delta
+        demand = {n: 0.0 for n in self.assets}
+        for o in orders:
+            for a, d in o.allocation_deltas.items():
+                if a in demand:
+                    demand[a] += d
         return demand
 
     def step(self, orders: List[AgentOrder]) -> Dict[str, float]:
-        """Apply one period's aggregated demand to all assets and return the
-        realized percentage price changes, keyed by asset name."""
         demand = self.aggregate_demand(orders)
-        # Demand deltas are individual agents' allocation changes for this
-        # period only (typically a few percentage points, e.g. 0.03 for a
-        # 3pp shift). We scale by 10 so a typical single-rule trigger (a few
-        # pp) maps to a visible but realistic few-percent price move, rather
-        # than the *100 scaling used previously which made price changes an
-        # order of magnitude too large and caused multi-period compounding
-        # to blow up into economically meaningless price levels.
-        scaled_demand = {k: v * 10 for k, v in demand.items()}
+        bias = regime_asset_bias(self.env.regime)
         pct_changes = {}
         for name, asset in self.assets.items():
-            pct_changes[name] = asset.apply_demand(scaled_demand[name], self.rng)
+            scaled = demand[name] * 10
+            pct_changes[name] = asset.apply_demand(scaled, self.rng, bias[name] * 0.15)
+        # Update valuations each period
+        sv: StockValuation = self.valuations["Stocks"]
+        bv: BondValuation  = self.valuations["Bonds"]
+        gv: GoldValuation  = self.valuations["Gold"]
+        sv.update(self.assets["Stocks"].price, self.env.gdp_growth, self.rng)
+        bv.update(self.env.interest_rate, self.env.inflation, self.rng)
+        gv.update(self.rng)
+        er = self.expected_returns(self.env)
+        self.expected_return_history.append(er)
         return pct_changes
 
     def set_environment(self, env: MacroEnvironment):
         self.env = env
         self.env_history.append(env)
+        self.regime_history.append(env.regime)
 
-
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # SIMULATION ENGINE
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class LogEntry:
@@ -771,315 +789,221 @@ class LogEntry:
     headline: str
     details: List[str]
     stock_change: float
-    bond_change: float
-    gold_change: float
-
+    bond_change:  float
+    gold_change:  float
+    regime: str
+    funding_ratio: float
 
 class SimulationEngine:
-    """
-    Orchestrates the full period-by-period simulation:
-
-        for each period:
-            1. agents observe the environment (and may drift it slightly,
-               representing realistic macro persistence + noise)
-            2. each agent decides on an order
-            3. market aggregates demand and updates prices
-            4. agents mark their portfolios to market
-            5. a human-readable log entry is recorded
-
-    The engine also supports macro "drift": rather than holding inflation,
-    rates, GDP growth, and oil shock perfectly constant for 100 periods
-    (unrealistic), each environment variable does a small mean-reverting
-    random walk around the user-set baseline, which gives the simulation
-    enough texture for momentum/contrarian rules to actually trigger.
-    """
-
     def __init__(self, base_env: MacroEnvironment, periods: int = 100, seed: int = 42):
         self.base_env = base_env
-        self.periods = periods
-        self.rng = random.Random(seed)
-        self.market = Market(base_env, seed=seed)
+        self.periods  = periods
+        self.rng      = random.Random(seed)
+        self.market   = Market(base_env, seed=seed)
         self.agents: List[Agent] = [PensionFund(), HedgeFund(), RetailInvestor()]
         self.logs: List[LogEntry] = []
         self.demand_history: List[Dict[str, float]] = []
+        # Track regime probabilities over time (smoothed Markov posterior)
+        self.regime_prob_history: List[Dict[str, float]] = []
+        self._regime_probs: Dict[str, float] = {r: 0.25 for r in REGIMES}
 
-    def _drift_environment(self, prev_env: MacroEnvironment, period: int) -> MacroEnvironment:
-        """Small mean-reverting random walk around the user-set baseline so
-        the 100-period run has realistic texture instead of a flat macro
-        backdrop. Sentiment occasionally shifts by one notch."""
-        def mean_revert(value, base, vol, lower=None, upper=None):
-            reverted = value + (base - value) * 0.08 + self.rng.gauss(0, vol)
-            if lower is not None:
-                reverted = max(reverted, lower)
-            if upper is not None:
-                reverted = min(reverted, upper)
-            return reverted
+    def _drift_environment(self, prev: MacroEnvironment) -> MacroEnvironment:
+        def mr(v, base, vol, lo=None, hi=None):
+            out = v + (base - v)*0.08 + self.rng.gauss(0, vol)
+            if lo is not None: out = max(out, lo)
+            if hi is not None: out = min(out, hi)
+            return out
 
-        new_inflation = mean_revert(prev_env.inflation, self.base_env.inflation, 0.25, lower=-2.0)
-        new_rate = mean_revert(prev_env.interest_rate, self.base_env.interest_rate, 0.2, lower=0.0)
-        new_gdp = mean_revert(prev_env.gdp_growth, self.base_env.gdp_growth, 0.3, lower=-10.0, upper=10.0)
-        new_oil = mean_revert(prev_env.oil_shock, self.base_env.oil_shock, 1.5, lower=-50.0, upper=150.0)
+        new_inf  = mr(prev.inflation,       self.base_env.inflation,       0.22, lo=-2.0)
+        new_rate = mr(prev.interest_rate,   self.base_env.interest_rate,   0.18, lo=0.0)
+        new_gdp  = mr(prev.gdp_growth,      self.base_env.gdp_growth,      0.28, lo=-10, hi=10)
+        new_oil  = mr(prev.oil_shock,       self.base_env.oil_shock,       1.4,  lo=-50, hi=150)
 
-        # Sentiment: mean-reverts toward the user-selected BASELINE sentiment,
-        # not a pure unbiased random walk. Without this pull, sentiment would
-        # wander away from the chosen scenario over a 100-period run (e.g. a
-        # "Bull Market" baseline of Bullish could drift all the way to Very
-        # Bearish purely by chance), which would silently defeat the
-        # scenario selector. The bias direction is computed relative to the
-        # BASE index so the simulation reliably reflects the chosen regime
-        # while still allowing realistic period-to-period texture.
         base_idx = SENTIMENT_LEVELS.index(self.base_env.sentiment)
-        idx = SENTIMENT_LEVELS.index(prev_env.sentiment)
-        if self.rng.random() < 0.18:
-            if idx < base_idx:
-                step = 1
-            elif idx > base_idx:
-                step = -1
-            else:
-                step = self.rng.choice([-1, 1])
-            idx = max(0, min(len(SENTIMENT_LEVELS) - 1, idx + step))
-        new_sentiment = SENTIMENT_LEVELS[idx]
+        idx      = SENTIMENT_LEVELS.index(prev.sentiment)
+        if self.rng.random() < 0.17:
+            step = 1 if idx < base_idx else -1 if idx > base_idx else self.rng.choice([-1,1])
+            idx  = max(0, min(len(SENTIMENT_LEVELS)-1, idx+step))
 
-        return MacroEnvironment(new_inflation, new_rate, new_gdp, new_oil, new_sentiment)
+        # Regime transition
+        new_regime = next_regime(prev.regime, self.rng)
+
+        return MacroEnvironment(new_inf, new_rate, new_gdp, new_oil,
+                                SENTIMENT_LEVELS[idx], regime=new_regime)
+
+    def _update_regime_probs(self, current_regime: str):
+        """Exponential-smoothed estimate of regime posterior for the dashboard."""
+        target = {r: 0.02 for r in REGIMES}
+        target[current_regime] = 0.94
+        alpha = 0.12
+        for r in REGIMES:
+            self._regime_probs[r] = (1-alpha)*self._regime_probs[r] + alpha*target[r]
+        self.regime_prob_history.append(dict(self._regime_probs))
 
     def run(self):
-        """Execute the full simulation and populate logs/history in place."""
         current_env = self.base_env
-        for period in range(1, self.periods + 1):
+        for period in range(1, self.periods+1):
             if period > 1:
-                current_env = self._drift_environment(current_env, period)
+                current_env = self._drift_environment(current_env)
                 self.market.set_environment(current_env)
+            self._update_regime_probs(current_env.regime)
 
-            orders = [agent.decide(current_env, self.market, period) for agent in self.agents]
-            for agent, order in zip(self.agents, orders):
-                agent.apply_order(order)
+            orders = [a.decide(current_env, self.market, period) for a in self.agents]
+            for a, o in zip(self.agents, orders):
+                a.apply_order(o)
 
             pct_changes = self.market.step(orders)
-
-            for agent in self.agents:
-                agent.update_portfolio_value(pct_changes)
+            for a in self.agents:
+                a.update_portfolio_value(pct_changes)
 
             demand = self.market.aggregate_demand(orders)
             self.demand_history.append(demand)
 
-            self.logs.append(self._build_log_entry(period, current_env, orders, pct_changes))
+            # Get pension fund funding ratio for this period
+            pension = next(a for a in self.agents if isinstance(a, PensionFund))
+            fr = pension.funding_ratio_history[-1] if pension.funding_ratio_history else 100.0
 
+            self.logs.append(self._build_log(period, current_env, orders, pct_changes, fr))
         return self
 
-    def _build_log_entry(self, period, env, orders, pct_changes) -> LogEntry:
-        triggered = []
-        for order in orders:
-            for r in order.rationale:
-                if "No threshold" not in r and "No momentum" not in r and "Neutral sentiment" not in r:
-                    triggered.append(f"{order.agent_name}: {r}")
-
-        if env.is_recession():
-            headline = "Recession conditions weighing on risk assets"
+    def _build_log(self, period, env, orders, pct_changes, fr) -> LogEntry:
+        triggered = [
+            f"{o.agent_name}: {r}"
+            for o in orders for r in o.rationale
+            if not any(x in r for x in ("No active signal","No directional","F/G balanced","No threshold","No momentum","Neutral sentiment","strategic 40"))
+        ]
+        regime_tag = f"[{env.regime}]"
+        if env.regime == "Recession":
+            headline = f"{regime_tag} Recession: risk assets under broad pressure"
         elif env.is_high_inflation():
-            headline = "Elevated inflation reshaping allocations"
-        elif env.is_oil_crisis():
-            headline = "Oil price shock rippling through portfolios"
-        elif pct_changes["Stocks"] > 2:
-            headline = "Broad-based equity strength"
-        elif pct_changes["Stocks"] < -2:
-            headline = "Equity markets under pressure"
+            headline = f"{regime_tag} Elevated inflation reshaping agent allocations"
+        elif pct_changes["Stocks"] > 2.5:
+            headline = f"{regime_tag} Equity rally — risk appetite building"
+        elif pct_changes["Stocks"] < -2.5:
+            headline = f"{regime_tag} Equity sell-off — agents repositioning"
         else:
-            headline = "Markets trading in a narrow range"
+            headline = f"{regime_tag} Markets consolidating"
+        return LogEntry(period, headline, triggered[:6],
+                        pct_changes["Stocks"], pct_changes["Bonds"], pct_changes["Gold"],
+                        env.regime, fr)
 
-        return LogEntry(
-            period=period,
-            headline=headline,
-            details=triggered[:6],  # cap for readability
-            stock_change=pct_changes["Stocks"],
-            bond_change=pct_changes["Bonds"],
-            gold_change=pct_changes["Gold"],
-        )
-
-
-# ==================================================================================
-# INSTITUTIONAL ANALYSIS — rule-based natural language generation
-# (NO external AI API calls; purely derived from simulation arrays/results)
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# INSTITUTIONAL NARRATIVE (rule-based NLG)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def generate_institutional_summary(engine: SimulationEngine) -> str:
-    """
-    Build a short, professional-sounding narrative summary purely from
-    simulation statistics: correlations, volatility, drawdowns, and which
-    agent contributed the most net demand to which asset. This mirrors a
-    real "risk commentary" paragraph a multi-asset desk might write, but is
-    entirely templated/rule-based — there is no generative model call here.
-    """
-    market = engine.market
-    stocks = pd.Series(market.assets["Stocks"].price_history)
-    bonds = pd.Series(market.assets["Bonds"].price_history)
-    gold = pd.Series(market.assets["Gold"].price_history)
+    m  = engine.market
+    stocks = pd.Series(m.assets["Stocks"].price_history)
+    bonds  = pd.Series(m.assets["Bonds"].price_history)
+    gold   = pd.Series(m.assets["Gold"].price_history)
 
-    stock_total_return = market.assets["Stocks"].total_return_pct()
-    bond_total_return = market.assets["Bonds"].total_return_pct()
-    gold_total_return = market.assets["Gold"].total_return_pct()
+    sr = m.assets["Stocks"].total_return_pct()
+    br = m.assets["Bonds"].total_return_pct()
+    gr = m.assets["Gold"].total_return_pct()
+    sv = stocks.pct_change().std()*100
+    sd = ((stocks/stocks.cummax())-1).min()*100
+    sbc = stocks.pct_change().corr(bonds.pct_change())
+    sgc = stocks.pct_change().corr(gold.pct_change())
 
-    stock_vol = stocks.pct_change().dropna().std() * 100
-    stock_dd = ((stocks / stocks.cummax()) - 1).min() * 100
+    pension = next(a for a in engine.agents if isinstance(a, PensionFund))
+    hedge   = next(a for a in engine.agents if isinstance(a, HedgeFund))
+    retail  = next(a for a in engine.agents if isinstance(a, RetailInvestor))
 
-    stock_bond_corr = stocks.pct_change().corr(bonds.pct_change())
-    stock_gold_corr = stocks.pct_change().corr(gold.pct_change())
+    min_fr = min(pension.funding_ratio_history) if pension.funding_ratio_history else 100
+    max_fr = max(pension.funding_ratio_history) if pension.funding_ratio_history else 100
+    final_fr = pension.funding_ratio_history[-1] if pension.funding_ratio_history else 100
 
-    # Net demand contribution by agent, summed over the whole run. We use
-    # net STOCKS demand specifically (rather than summing across all assets,
-    # including Cash) because Cash deltas are mechanically the offsetting
-    # leg of a Stocks trade for several agents — summing them together would
-    # cancel out the very signal we're trying to measure ("who pushed
-    # equities the hardest"). Stocks is the asset every agent trades, so it
-    # is the most meaningful common basis for comparison.
-    net_stock_demand_by_agent = {agent.name: 0.0 for agent in engine.agents}
-    for agent in engine.agents:
-        for order in agent.trade_log:
-            net_stock_demand_by_agent[agent.name] += order.allocation_deltas.get("Stocks", 0.0)
+    max_lever = max(hedge.leverage_ratio_history) if hedge.leverage_ratio_history else 1.0
+    avg_greed = np.mean(retail.greed_history) if retail.greed_history else 50
 
-    biggest_net_buyer = max(net_stock_demand_by_agent, key=net_stock_demand_by_agent.get)
-    biggest_net_seller = min(net_stock_demand_by_agent, key=net_stock_demand_by_agent.get)
+    # Regime time-shares
+    regime_counts = pd.Series(engine.market.regime_history).value_counts()
+    dominant_regime = regime_counts.index[0] if len(regime_counts) else "Expansion"
+    dom_pct = regime_counts.iloc[0] / len(engine.market.regime_history) * 100 if engine.market.regime_history else 0
 
-    base_env = engine.base_env
-    regime_bits = []
-    if base_env.is_high_inflation():
-        regime_bits.append("an inflationary backdrop")
-    if base_env.is_recession():
-        regime_bits.append("recessionary growth conditions")
-    if base_env.is_high_rates():
-        regime_bits.append("a restrictive rate environment")
-    if base_env.is_oil_crisis():
-        regime_bits.append("an energy price shock")
-    if not regime_bits:
-        regime_bits.append("a broadly neutral macro backdrop")
-    regime_desc = " combined with ".join(regime_bits)
-
-    paragraphs = []
-
-    paragraphs.append(
-        f"Under {regime_desc}, the simulated market produced a {stock_total_return:+.1f}% "
-        f"cumulative return in equities, {bond_total_return:+.1f}% in bonds, and "
-        f"{gold_total_return:+.1f}% in gold over {engine.periods} periods. Realized equity "
-        f"volatility was approximately {stock_vol:.1f}% per period, with a maximum drawdown "
-        f"of {stock_dd:.1f}%."
+    paras = []
+    env = engine.base_env
+    reg_desc = f"a {env.regime.lower()}-dominated regime" if dom_pct > 60 else "a mixed-regime environment"
+    paras.append(
+        f"Over {engine.periods} simulation periods under {reg_desc} "
+        f"({dominant_regime} {dom_pct:.0f}% of periods), the market produced "
+        f"cumulative returns of {sr:+.1f}% equities, {br:+.1f}% bonds, and "
+        f"{gr:+.1f}% gold. Realised equity volatility averaged {sv:.1f}% per period "
+        f"with a peak drawdown of {sd:.1f}%."
     )
 
-    if stock_bond_corr < -0.15:
-        corr_desc = (
-            f"Stocks and bonds exhibited a negative correlation of {stock_bond_corr:.2f}, "
-            "consistent with bonds functioning as a diversifying hedge during episodes of "
-            "equity weakness — a classic 'flight to safety' dynamic."
-        )
-    elif stock_bond_corr > 0.15:
-        corr_desc = (
-            f"Stocks and bonds moved together with a correlation of {stock_bond_corr:.2f}, "
-            "suggesting both asset classes were being driven by a common factor — most "
-            "consistent with an inflation or rate-shock regime where both risk assets and "
-            "duration sell off together."
-        )
+    if sbc < -0.15:
+        paras.append(f"The stock–bond correlation of {sbc:.2f} confirmed a classic diversification dynamic, "
+                     f"with bonds providing a cushion during equity drawdowns — consistent with a rate environment "
+                     f"where duration served as a risk-off haven.")
+    elif sbc > 0.15:
+        paras.append(f"A positive stock–bond correlation of {sbc:.2f} reflects the inflationary or rate-shock "
+                     f"character of the regime, where rising rates penalised both duration and risk assets "
+                     f"simultaneously — the classic 'both sell off' inflation regime.")
     else:
-        corr_desc = (
-            f"Stocks and bonds were largely uncorrelated ({stock_bond_corr:.2f}), implying "
-            "diversification benefits held up over the simulated horizon."
-        )
-    paragraphs.append(corr_desc)
+        paras.append(f"Stocks and bonds were broadly uncorrelated ({sbc:.2f}), suggesting neither a "
+                     f"pure risk-on/risk-off nor an inflation-dominated regime held for the full run.")
 
-    if gold_total_return > stock_total_return and gold_total_return > 0:
-        gold_desc = (
-            "Gold outperformed equities over the period, consistent with its role as a "
-            "real-asset hedge that agents rotated into during stress episodes."
-        )
-    elif stock_gold_corr < -0.1:
-        gold_desc = (
-            f"Gold showed a {stock_gold_corr:.2f} correlation with equities, behaving as a "
-            "partial hedge against risk-asset drawdowns."
-        )
+    fr_commentary = ""
+    if final_fr < 95:
+        fr_commentary = f"The pension fund finished below full funding ({final_fr:.1f}%), with a trough of {min_fr:.1f}% — the liability-driven mandate triggered meaningful defensive shifts that weighed on equity demand."
+    elif final_fr > 115:
+        fr_commentary = f"The pension fund accumulated a material surplus (final funding ratio {final_fr:.1f}%, peak {max_fr:.1f}%), enabling it to take additional equity risk in the return-seeking portfolio."
     else:
-        gold_desc = (
-            "Gold's performance tracked broader risk sentiment rather than acting as a "
-            "consistent hedge in this run."
-        )
-    paragraphs.append(gold_desc)
+        fr_commentary = f"The pension fund's funding ratio remained broadly near full funding (range {min_fr:.1f}%–{max_fr:.1f}%), allowing the liability-driven mandate to operate near its strategic benchmark."
+    paras.append(fr_commentary)
 
-    if biggest_net_buyer == biggest_net_seller:
-        behavior_desc = (
-            f"At the agent level, net positioning shifts were modest and broadly balanced across "
-            f"the three agent types over this run, with {biggest_net_buyer} showing the largest "
-            f"absolute swing in equity allocation. This is broadly consistent with the calibrated "
-            f"archetypes: pension funds provide a stabilizing, counter-cyclical bid during "
-            f"drawdowns and rotate toward bonds as inflation protection; hedge funds amplify "
-            f"directional moves through leveraged, momentum-driven positioning; and retail "
-            f"investors tend to chase winners during rallies and exit aggressively during "
-            f"drawdowns, contributing disproportionately to realized volatility."
-        )
-    else:
-        behavior_desc = (
-            f"At the agent level, {biggest_net_buyer} was the largest net source of buying "
-            f"pressure on equities over the simulation, while {biggest_net_seller} was the "
-            f"largest net seller. This is broadly consistent with the calibrated archetypes: "
-            f"pension funds provide a stabilizing, counter-cyclical bid during drawdowns and "
-            f"rotate toward bonds as inflation protection; hedge funds amplify directional "
-            f"moves through leveraged, momentum-driven positioning; and retail investors tend "
-            f"to chase winners during rallies and exit aggressively during drawdowns, "
-            f"contributing disproportionately to realized volatility."
-        )
-    paragraphs.append(behavior_desc)
-
-    closing = (
-        "Taken together, the model suggests that the simulated regime favored "
-        + ("duration and defensive positioning" if bond_total_return > stock_total_return else "risk assets")
-        + " on a risk-adjusted basis, with retail flow acting as a volatility amplifier "
-        "rather than a stabilizing force — a pattern broadly consistent with how "
-        "heterogeneous investor behavior is understood to shape realized market dynamics."
+    paras.append(
+        f"The hedge fund reached a peak gross leverage of {max_lever:.2f}x, with trend and valuation "
+        f"signals {'aligned for extended periods, enabling leveraged directional positioning' if max_lever > 1.6 else 'frequently in conflict, constraining gross exposure and leverage'}. "
+        f"Risk-budget constraints scaled positions during elevated volatility regimes."
     )
-    paragraphs.append(closing)
 
-    return "\n\n".join(paragraphs)
+    paras.append(
+        f"Retail investor sentiment averaged a greed score of {avg_greed:.0f}/100 over the run. "
+        f"{'Fear episodes drove sharp pro-cyclical selling that amplified drawdowns beyond what valuation alone would justify.' if avg_greed < 45 else 'Sustained greed contributed to momentum-chasing flows that extended rallies and compressed risk premia.'}"
+    )
 
+    paras.append(
+        "On a risk-adjusted basis, the simulation favoured "
+        + ("duration and defensive assets" if br > sr else "equities and real assets")
+        + f". The interaction of heterogeneous agents — a liability-constrained pension fund, a signal-driven "
+        f"hedge fund, and an emotionally reactive retail investor — produced price dynamics that neither "
+        f"efficient-market models nor simple factor regressions would fully capture."
+    )
+    return "\n\n".join(paras)
 
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # SCENARIO PRESETS
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 SCENARIOS = {
-    "Rate Shock": dict(inflation=4.0, interest_rate=7.5, gdp_growth=1.0, oil_shock=0.0, sentiment="Bearish"),
-    "Inflation Shock": dict(inflation=8.5, interest_rate=6.0, gdp_growth=1.5, oil_shock=5.0, sentiment="Bearish"),
-    "Recession": dict(inflation=1.5, interest_rate=2.0, gdp_growth=-2.5, oil_shock=-10.0, sentiment="Very Bearish"),
-    "Oil Crisis": dict(inflation=6.0, interest_rate=5.0, gdp_growth=0.5, oil_shock=35.0, sentiment="Bearish"),
-    "Bull Market": dict(inflation=2.0, interest_rate=3.0, gdp_growth=3.5, oil_shock=0.0, sentiment="Bullish"),
-    "AI Boom": dict(inflation=2.5, interest_rate=3.5, gdp_growth=4.5, oil_shock=-5.0, sentiment="Very Bullish"),
+    "Rate Shock":       dict(inflation=4.0,  interest_rate=7.5, gdp_growth=1.0,  oil_shock=0.0,  sentiment="Bearish",    regime="Slowdown"),
+    "Inflation Shock":  dict(inflation=8.5,  interest_rate=6.0, gdp_growth=1.5,  oil_shock=5.0,  sentiment="Bearish",    regime="Slowdown"),
+    "Recession":        dict(inflation=1.5,  interest_rate=2.0, gdp_growth=-2.5, oil_shock=-10.0,sentiment="Very Bearish",regime="Recession"),
+    "Oil Crisis":       dict(inflation=6.0,  interest_rate=5.0, gdp_growth=0.5,  oil_shock=35.0, sentiment="Bearish",    regime="Slowdown"),
+    "Bull Market":      dict(inflation=2.0,  interest_rate=3.0, gdp_growth=3.5,  oil_shock=0.0,  sentiment="Bullish",    regime="Expansion"),
+    "AI Boom":          dict(inflation=2.5,  interest_rate=3.5, gdp_growth=4.5,  oil_shock=-5.0, sentiment="Very Bullish",regime="Expansion"),
+    "Recovery":         dict(inflation=2.8,  interest_rate=3.2, gdp_growth=2.2,  oil_shock=-5.0, sentiment="Neutral",    regime="Recovery"),
 }
 
-
-# ==================================================================================
-# STREAMLIT APP STATE HELPERS
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE
+# ══════════════════════════════════════════════════════════════════════════════
 
 def init_session_state():
-    defaults = dict(
-        inflation=3.0,
-        interest_rate=4.0,
-        gdp_growth=2.0,
-        oil_shock=0.0,
-        sentiment="Neutral",
-        periods=100,
-        seed=42,
-        engine=None,
-        last_run_params=None,
-    )
+    defaults = dict(inflation=3.0, interest_rate=4.0, gdp_growth=2.0, oil_shock=0.0,
+                    sentiment="Neutral", regime="Expansion", periods=100, seed=42,
+                    engine=None, last_run_params=None)
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-
-def apply_scenario(name: str):
-    params = SCENARIOS[name]
-    st.session_state["inflation"] = params["inflation"]
-    st.session_state["interest_rate"] = params["interest_rate"]
-    st.session_state["gdp_growth"] = params["gdp_growth"]
-    st.session_state["oil_shock"] = params["oil_shock"]
-    st.session_state["sentiment"] = params["sentiment"]
-    st.session_state["pending_scenario"] = name
-
+def apply_scenario_and_run(name: str):
+    p = SCENARIOS[name]
+    for k, v in p.items():
+        st.session_state[k] = v
+    run_simulation()
 
 def run_simulation():
     env = MacroEnvironment(
@@ -1088,342 +1012,425 @@ def run_simulation():
         gdp_growth=st.session_state["gdp_growth"],
         oil_shock=st.session_state["oil_shock"],
         sentiment=st.session_state["sentiment"],
+        regime=st.session_state["regime"],
     )
     engine = SimulationEngine(env, periods=st.session_state["periods"], seed=st.session_state["seed"])
     engine.run()
     st.session_state["engine"] = engine
-    st.session_state["last_run_params"] = dict(
-        inflation=env.inflation,
-        interest_rate=env.interest_rate,
-        gdp_growth=env.gdp_growth,
-        oil_shock=env.oil_shock,
-        sentiment=env.sentiment,
-    )
 
-
-def apply_scenario_and_run(name: str):
-    """Callback used by the scenario buttons. Runs in the on_click phase,
-    i.e. BEFORE the script body (and therefore the sidebar sliders/selectbox
-    bound to the same session_state keys) is re-instantiated on the rerun
-    triggered by the click. Mutating those keys here is safe; doing the same
-    mutation after the widgets have already been created in this run (as the
-    old inline `if button: ...` block did) is what raised the
-    StreamlitAPIException."""
-    apply_scenario(name)
-    run_simulation()
-
-
-# ==================================================================================
-# SIDEBAR — MARKET ENVIRONMENT CONTROLS
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
 
 def render_sidebar():
     st.sidebar.markdown(
-        f"<div style='font-family:monospace;font-size:1.1rem;font-weight:700;color:{COLORS['text']};'>"
-        "AGENT TWIN</div>"
-        f"<div style='color:{COLORS['text_dim']};font-size:0.78rem;margin-bottom:1rem;'>"
-        "Market Environment Controls</div>",
+        f"<div style='font-family:monospace;font-size:1.05rem;font-weight:700;color:{C['text']};'>"
+        "AGENT TWIN <span style='color:{c};font-size:.7rem;'>v2</span></div>"
+        f"<div style='color:{C['text_dim']};font-size:.76rem;margin-bottom:1rem;'>"
+        "Institutional Market Simulator</div>".replace("{c}", C["green"]),
         unsafe_allow_html=True,
     )
-
-    st.sidebar.slider("Inflation (%)", -2.0, 12.0, key="inflation", step=0.1)
-    st.sidebar.slider("Interest Rate (%)", 0.0, 12.0, key="interest_rate", step=0.1)
-    st.sidebar.slider("GDP Growth (%)", -8.0, 8.0, key="gdp_growth", step=0.1)
-    st.sidebar.slider("Oil Price Shock (%)", -50.0, 100.0, key="oil_shock", step=1.0)
+    st.sidebar.slider("Inflation (%)",       -2.0, 12.0, key="inflation",      step=0.1)
+    st.sidebar.slider("Interest Rate (%)",    0.0, 12.0, key="interest_rate",  step=0.1)
+    st.sidebar.slider("GDP Growth (%)",      -8.0,  8.0, key="gdp_growth",     step=0.1)
+    st.sidebar.slider("Oil Price Shock (%)", -50.0,100.0, key="oil_shock",     step=1.0)
     st.sidebar.selectbox("Market Sentiment", SENTIMENT_LEVELS, key="sentiment")
+    st.sidebar.selectbox("Starting Regime",  REGIMES, key="regime")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown(
-        f"<div style='font-size:0.78rem;color:{COLORS['text_dim']};text-transform:uppercase;"
-        "letter-spacing:0.08em;margin-bottom:0.4rem;'>Simulation Settings</div>",
-        unsafe_allow_html=True,
-    )
-    st.sidebar.slider("Periods to Simulate", 20, 250, key="periods", step=10)
-    st.sidebar.number_input("Random Seed", min_value=0, max_value=9999, key="seed", step=1)
+        f"<div style='font-size:.75rem;color:{C['text_dim']};text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem;'>Simulation Settings</div>",
+        unsafe_allow_html=True)
+    st.sidebar.slider("Periods", 20, 250, key="periods", step=10)
+    st.sidebar.number_input("Random Seed", 0, 9999, key="seed", step=1)
 
     st.sidebar.markdown("---")
     st.sidebar.markdown(
-        f"<div style='font-size:0.78rem;color:{COLORS['text_dim']};text-transform:uppercase;"
-        "letter-spacing:0.08em;margin-bottom:0.4rem;'>Scenario Engine</div>",
-        unsafe_allow_html=True,
-    )
-
-    scenario_cols = st.sidebar.columns(2)
-    scenario_names = list(SCENARIOS.keys())
-    for i, sname in enumerate(scenario_names):
-        col = scenario_cols[i % 2]
-        col.button(
-            sname,
-            key=f"scenario_{sname}",
-            use_container_width=True,
-            on_click=apply_scenario_and_run,
-            args=(sname,),
-        )
+        f"<div style='font-size:.75rem;color:{C['text_dim']};text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem;'>Scenario Presets</div>",
+        unsafe_allow_html=True)
+    cols = st.sidebar.columns(2)
+    for i, sname in enumerate(SCENARIOS):
+        cols[i%2].button(sname, key=f"sc_{sname}", use_container_width=True,
+                         on_click=apply_scenario_and_run, args=(sname,))
 
     st.sidebar.markdown("---")
-    run_clicked = st.sidebar.button("▶  RUN SIMULATION", use_container_width=True, type="primary")
-    if run_clicked:
+    if st.sidebar.button("▶  RUN SIMULATION", use_container_width=True, type="primary"):
         run_simulation()
         st.rerun()
 
     if st.session_state["engine"] is None:
-        st.sidebar.info("Set parameters and click Run Simulation, or choose a preset scenario above.")
+        st.sidebar.info("Configure environment and click Run, or choose a preset.")
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CHART HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ==================================================================================
-# MAIN PANEL RENDERERS
-# ==================================================================================
+def _fig(h=400, **kwargs) -> go.Figure:
+    f = go.Figure()
+    f.update_layout(**LAYOUT, height=h, **kwargs)
+    return f
+
+def _xaxis(n):
+    return list(range(n))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION RENDERERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def render_header():
-    st.markdown('<div class="agent-twin-header">AGENT TWIN</div>', unsafe_allow_html=True)
+    st.markdown('<div class="at-header">AGENT TWIN <span style="font-size:1rem;color:#16a34a;">v2</span></div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="agent-twin-subheader">A digital twin of financial markets — '
-        'prices emerge from the interaction of heterogeneous investor agents, '
-        'not from fitted historical correlations.</div>',
+        '<div class="at-sub">Valuation-aware institutional market simulator — '
+        'P/E, bond yields, fear/greed, funding ratios, and market regimes drive agent behaviour. '
+        'Prices emerge from heterogeneous agent interaction.</div>',
         unsafe_allow_html=True,
     )
 
-
-def render_agent_rulebook():
-    with st.expander("📋  Agent Decision Rules (transparent rule engine)", expanded=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown(f"**Pension Fund** &nbsp;<span class='badge'>Risk-averse</span>", unsafe_allow_html=True)
-            rules = [
-                "IF inflation > 5% → increase bond allocation",
-                "IF GDP growth < 1% → reduce equity exposure",
-                "IF stocks fall > 8% (5-period) → contrarian buy",
-                "IF stocks rise > 15% (5-period) → trim equities",
-                "IF oil shock > 15% → rotate modestly to gold",
-            ]
-            for r in rules:
-                st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"**Hedge Fund** &nbsp;<span class='badge'>Momentum</span>", unsafe_allow_html=True)
-            rules = [
-                "IF stocks rising (3-period) → add leveraged exposure",
-                "IF stocks falling (3-period) → cut exposure / short",
-                "IF sentiment bullish → add leverage",
-                "IF sentiment bearish → de-risk",
-                "IF recession or oil crisis → rotate to gold",
-                "IF rates > 5% → deleverage",
-            ]
-            for r in rules:
-                st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
-        with c3:
-            st.markdown(f"**Retail Investor** &nbsp;<span class='badge'>Sentiment</span>", unsafe_allow_html=True)
-            rules = [
-                "IF sentiment bullish → buy winners",
-                "IF sentiment bearish → panic sell",
-                "IF stocks rising (3-period) → chase performance",
-                "IF stocks fall > 6% (5-period) → panic sell",
-                "IF recession → sell aggressively",
-            ]
-            for r in rules:
-                st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
-
-
-def render_environment_summary(engine: SimulationEngine):
+def render_env_strip(engine: SimulationEngine):
     env = engine.base_env
-    cols = st.columns(5)
-    labels = ["Inflation", "Interest Rate", "GDP Growth", "Oil Shock", "Sentiment"]
-    values = [f"{env.inflation:.1f}%", f"{env.interest_rate:.1f}%", f"{env.gdp_growth:.1f}%",
-              f"{env.oil_shock:+.1f}%", env.sentiment]
-    for col, label, value in zip(cols, labels, values):
+    items = [
+        ("Inflation", f"{env.inflation:.1f}%"),
+        ("Policy Rate", f"{env.interest_rate:.1f}%"),
+        ("GDP Growth", f"{env.gdp_growth:.1f}%"),
+        ("Oil Shock", f"{env.oil_shock:+.0f}%"),
+        ("Sentiment", env.sentiment),
+        ("Starting Regime", env.regime),
+    ]
+    cols = st.columns(len(items))
+    for col, (lbl, val) in zip(cols, items):
         col.markdown(
-            f"<div class='panel-card' style='text-align:center;padding:0.7rem;'>"
-            f"<div class='metric-label'>{label}</div>"
-            f"<div style='font-size:1.3rem;font-family:monospace;margin-top:0.2rem;'>{value}</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
+            f"<div class='panel' style='text-align:center;padding:.6rem .5rem;'>"
+            f"<div class='metric-label'>{lbl}</div>"
+            f"<div class='metric-value' style='font-size:1.05rem;'>{val}</div></div>",
+            unsafe_allow_html=True)
 
-
-def render_price_chart(engine: SimulationEngine):
-    market = engine.market
-    periods = list(range(len(market.assets["Stocks"].price_history)))
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=periods, y=market.assets["Stocks"].price_history, name="Stocks",
-        line=dict(color=COLORS["stock"], width=2.2),
-    ))
-    fig.add_trace(go.Scatter(
-        x=periods, y=market.assets["Bonds"].price_history, name="Bonds",
-        line=dict(color=COLORS["bond"], width=2.2),
-    ))
-    fig.add_trace(go.Scatter(
-        x=periods, y=market.assets["Gold"].price_history, name="Gold",
-        line=dict(color=COLORS["gold"], width=2.2),
-    ))
-    fig.update_layout(
-        **PLOTLY_TEMPLATE["layout"],
-        title=dict(text="Asset Price Evolution", font=dict(size=15)),
-        xaxis_title="Period",
-        yaxis_title="Index Level (Start = 100)",
-        height=420,
-        hovermode="x unified",
-    )
+def render_regime_chart(engine: SimulationEngine):
+    if not engine.regime_prob_history:
+        return
+    df = pd.DataFrame(engine.regime_prob_history)
+    df.index = range(1, len(df)+1)
+    fig = _fig(h=280, title=dict(text="Market Regime Probabilities (smoothed)", font=dict(size=14)))
+    for r in REGIMES:
+        if r in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df[r]*100, name=r,
+                stackgroup="one",
+                line=dict(width=0, color=REGIME_COLORS[r]),
+                fillcolor=REGIME_COLORS[r],
+                opacity=0.75,
+            ))
+    fig.update_layout(xaxis_title="Period", yaxis_title="Probability (%)",
+                      hovermode="x unified", yaxis=dict(range=[0,100], **LAYOUT["yaxis"]))
     st.plotly_chart(fig, use_container_width=True)
 
+def render_valuation_chart(engine: SimulationEngine):
+    sv: StockValuation = engine.market.valuations["Stocks"]
+    bv: BondValuation  = engine.market.valuations["Bonds"]
+
+    # Reconstruct P/E from earnings & price histories
+    stock_prices = engine.market.assets["Stocks"].price_history
+    # We only have end-state earnings; reconstruct index from history snapshots stored in er_history
+    er_hist = engine.market.expected_return_history
+    if not er_hist:
+        return
+
+    periods_x = list(range(1, len(er_hist)+1))
+    stock_er = [e["Stocks"] for e in er_hist]
+    bond_er  = [e["Bonds"]  for e in er_hist]
+    gold_er  = [e["Gold"]   for e in er_hist]
+
+    fig = _fig(h=320, title=dict(text="Expected Returns by Asset Class", font=dict(size=14)))
+    fig.add_trace(go.Scatter(x=periods_x, y=stock_er, name="Stocks", line=dict(color=C["stock"], width=2)))
+    fig.add_trace(go.Scatter(x=periods_x, y=bond_er,  name="Bonds",  line=dict(color=C["bond"],  width=2)))
+    fig.add_trace(go.Scatter(x=periods_x, y=gold_er,  name="Gold",   line=dict(color=C["gold"],  width=2)))
+    fig.add_hline(y=0, line_dash="dot", line_color=C["border"], line_width=1)
+    fig.update_layout(xaxis_title="Period", yaxis_title="Expected Return (%/period)",
+                      hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+def render_price_chart(engine: SimulationEngine):
+    m = engine.market
+    n = len(m.assets["Stocks"].price_history)
+    x = _xaxis(n)
+    fig = _fig(h=420, title=dict(text="Asset Price Evolution (Base = 100)", font=dict(size=14)))
+    for name, col in [("Stocks", C["stock"]), ("Bonds", C["bond"]), ("Gold", C["gold"])]:
+        fig.add_trace(go.Scatter(x=x, y=m.assets[name].price_history, name=name,
+                                 line=dict(color=col, width=2.2)))
+    # Shade recession periods
+    for i, env in enumerate(m.env_history):
+        if env.regime == "Recession":
+            fig.add_vrect(x0=i-0.5, x1=i+0.5,
+                         fillcolor=C["recession"], opacity=0.07, layer="below", line_width=0)
+    fig.update_layout(xaxis_title="Period", yaxis_title="Index Level", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+def render_summary_metrics(engine: SimulationEngine):
+    m = engine.market
+    cols = st.columns(3)
+    for col, name, clr in zip(cols, ["Stocks","Bonds","Gold"], [C["stock"],C["bond"],C["gold"]]):
+        tr = m.assets[name].total_return_pct()
+        color = C["green"] if tr >= 0 else C["red"]
+        col.markdown(
+            f"<div class='panel' style='text-align:center;'>"
+            f"<div class='metric-label'>{name} — Total Return</div>"
+            f"<div style='font-size:1.55rem;font-family:monospace;color:{color};margin-top:.15rem;'>{tr:+.1f}%</div>"
+            f"<div class='metric-label' style='margin-top:.3rem;'>Final: {m.assets[name].price:.2f}</div>"
+            "</div>", unsafe_allow_html=True)
+
+def render_funding_ratio_chart(engine: SimulationEngine):
+    pension = next(a for a in engine.agents if isinstance(a, PensionFund))
+    if not pension.funding_ratio_history:
+        return
+    fr = pension.funding_ratio_history
+    x  = list(range(1, len(fr)+1))
+    fig = _fig(h=320, title=dict(text="Pension Fund — Funding Ratio (%)", font=dict(size=14)))
+    fig.add_trace(go.Scatter(x=x, y=fr, name="Funding Ratio",
+                             line=dict(color=C["pension"], width=2.2),
+                             fill="tozeroy", fillcolor=f"rgba(59,130,166,0.08)"))
+    fig.add_hline(y=100, line_dash="dash", line_color=C["amber"],   annotation_text="100% (Full Funding)", line_width=1.5)
+    fig.add_hline(y=90,  line_dash="dot",  line_color=C["red"],     annotation_text="90% (De-risk Threshold)", line_width=1)
+    fig.add_hline(y=120, line_dash="dot",  line_color=C["green"],   annotation_text="120% (Risk-on Trigger)", line_width=1)
+    fig.update_layout(xaxis_title="Period", yaxis_title="Funding Ratio (%)", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    pension_inst = pension
+    metrics = [
+        ("Min Funding Ratio", f"{min(fr):.1f}%"),
+        ("Max Funding Ratio", f"{max(fr):.1f}%"),
+        ("Final Funding Ratio", f"{fr[-1]:.1f}%"),
+        ("Required Return", f"{pension_inst.required_return_pct:.1f}%"),
+    ]
+    for col, (lbl, val) in zip([c1,c2,c3,c4], metrics):
+        col.markdown(f"<div class='panel' style='text-align:center;padding:.7rem .5rem;'>"
+                     f"<div class='metric-label'>{lbl}</div>"
+                     f"<div class='metric-value' style='font-size:1.1rem;'>{val}</div></div>",
+                     unsafe_allow_html=True)
+
+def render_hedge_fund_dashboard(engine: SimulationEngine):
+    hedge = next(a for a in engine.agents if isinstance(a, HedgeFund))
+    if not hedge.gross_exposure_history:
+        return
+
+    x = list(range(len(hedge.gross_exposure_history)))
+    fig = _fig(h=320, title=dict(text="Hedge Fund — Gross / Net Exposure & Leverage", font=dict(size=14)))
+    fig.add_trace(go.Scatter(x=x, y=hedge.gross_exposure_history, name="Gross Exposure",
+                             line=dict(color=C["hedge"], width=2.2)))
+    fig.add_trace(go.Scatter(x=x, y=hedge.net_exposure_history, name="Net Exposure",
+                             line=dict(color=C["amber"], width=1.8, dash="dash")))
+    fig.add_hline(y=1.0, line_dash="dot", line_color=C["border"], line_width=1, annotation_text="1× (Unleveraged)")
+    fig.update_layout(xaxis_title="Period", yaxis_title="Exposure (×)", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Trend + Valuation signals
+    if hedge.trend_signal_history and hedge.valuation_signal_history:
+        xt = list(range(len(hedge.trend_signal_history)))
+        fig2 = _fig(h=260, title=dict(text="Hedge Fund — Trend & Valuation Signals", font=dict(size=14)))
+        fig2.add_trace(go.Scatter(x=xt, y=hedge.trend_signal_history, name="Trend Signal",
+                                  line=dict(color=C["stock"], width=2)))
+        fig2.add_trace(go.Scatter(x=xt, y=hedge.valuation_signal_history, name="Valuation Signal",
+                                  line=dict(color=C["purple"], width=2)))
+        fig2.add_hline(y=0, line_dash="dot", line_color=C["border"], line_width=1)
+        fig2.update_layout(xaxis_title="Period", yaxis_title="Signal (−1 to +1)", hovermode="x unified")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # Exposure KPIs
+    c1, c2, c3 = st.columns(3)
+    metrics = [
+        ("Peak Gross Leverage", f"{max(hedge.gross_exposure_history):.2f}×"),
+        ("Final Net Exposure",  f"{hedge.net_exposure_history[-1]:.2f}×"),
+        ("Risk Budget (Vol)",   f"{hedge.risk_budget_vol*100:.0f}% ann."),
+    ]
+    for col, (lbl, val) in zip([c1,c2,c3], metrics):
+        col.markdown(f"<div class='panel' style='text-align:center;padding:.7rem .5rem;'>"
+                     f"<div class='metric-label'>{lbl}</div>"
+                     f"<div class='metric-value' style='font-size:1.1rem;'>{val}</div></div>",
+                     unsafe_allow_html=True)
+
+def render_fear_greed_chart(engine: SimulationEngine):
+    retail = next(a for a in engine.agents if isinstance(a, RetailInvestor))
+    if not retail.fear_history:
+        return
+
+    x = list(range(len(retail.fear_history)))
+    fig = _fig(h=300, title=dict(text="Retail Investor — Fear / Greed Index", font=dict(size=14)))
+    fig.add_trace(go.Scatter(x=x, y=retail.greed_history, name="Greed",
+                             line=dict(color=C["green"], width=2.2),
+                             fill="tozeroy", fillcolor="rgba(22,163,74,0.07)"))
+    fig.add_trace(go.Scatter(x=x, y=retail.fear_history, name="Fear",
+                             line=dict(color=C["red"], width=2.2),
+                             fill="tozeroy", fillcolor="rgba(179,71,58,0.07)"))
+    fig.add_hline(y=50, line_dash="dot", line_color=C["border"], line_width=1)
+    fig.update_layout(xaxis_title="Period", yaxis_title="Index (0–100)", hovermode="x unified",
+                      yaxis=dict(range=[0,100], **LAYOUT["yaxis"]))
+    st.plotly_chart(fig, use_container_width=True)
+
+    c1, c2, c3 = st.columns(3)
+    metrics = [
+        ("Avg Greed Score", f"{np.mean(retail.greed_history):.0f}/100"),
+        ("Peak Fear Score", f"{max(retail.fear_history):.0f}/100"),
+        ("News Sensitivity", f"{retail.news_sensitivity:.1f}×"),
+    ]
+    for col, (lbl, val) in zip([c1,c2,c3], metrics):
+        col.markdown(f"<div class='panel' style='text-align:center;padding:.7rem .5rem;'>"
+                     f"<div class='metric-label'>{lbl}</div>"
+                     f"<div class='metric-value' style='font-size:1.1rem;'>{val}</div></div>",
+                     unsafe_allow_html=True)
 
 def render_allocation_chart(engine: SimulationEngine):
-    st.markdown("##### Agent Allocation Evolution")
     tabs = st.tabs([a.name for a in engine.agents])
+    palette = [C["stock"], C["bond"], C["gold"], C["text_dim"]]
     for tab, agent in zip(tabs, engine.agents):
         with tab:
             df = pd.DataFrame(agent.allocation_history)
-            df.index.name = "Period"
-            fig = go.Figure()
-            palette = [COLORS["stock"], COLORS["bond"], COLORS["gold"], COLORS["text_dim"]]
+            fig = _fig(h=340, title=dict(text=f"{agent.name} — Allocation Over Time", font=dict(size=13)))
             for i, col_name in enumerate(df.columns):
                 fig.add_trace(go.Scatter(
-                    x=df.index, y=df[col_name] * 100, name=col_name,
-                    stackgroup="one", line=dict(width=0.5, color=palette[i % len(palette)]),
+                    x=df.index, y=df[col_name]*100, name=col_name,
+                    stackgroup="one",
+                    line=dict(width=0.5, color=palette[i % len(palette)]),
                     fillcolor=palette[i % len(palette)],
                 ))
-            fig.update_layout(
-                **PLOTLY_TEMPLATE["layout"],
-                title=dict(text=f"{agent.name} — Allocation Weight Over Time", font=dict(size=14)),
-                xaxis_title="Period",
-                yaxis_title="Allocation (%)",
-                height=360,
-                hovermode="x unified",
-            )
+            fig.update_layout(xaxis_title="Period", yaxis_title="Allocation (%)", hovermode="x unified")
             st.plotly_chart(fig, use_container_width=True, key=f"alloc_{agent.name}")
 
-
 def render_demand_chart(engine: SimulationEngine):
-    st.markdown("##### Demand Pressure — Who Is Driving the Market")
-    demand_df = pd.DataFrame(engine.demand_history)
-    demand_df.index = range(1, len(demand_df) + 1)
-
-    net_by_agent_asset = []
+    asset_colors = {"Stocks": C["stock"], "Bonds": C["bond"], "Gold": C["gold"]}
+    net_by_agent = []
     for agent in engine.agents:
-        totals = {"Stocks": 0.0, "Bonds": 0.0, "Gold": 0.0, "Cash": 0.0}
-        for order in agent.trade_log:
-            for k, v in order.allocation_deltas.items():
+        totals = {k: 0.0 for k in ["Stocks","Bonds","Gold","Cash"]}
+        for o in agent.trade_log:
+            for k, v in o.allocation_deltas.items():
                 if k in totals:
                     totals[k] += v
-        net_by_agent_asset.append((agent.name, totals, agent.color))
+        net_by_agent.append((agent.name, totals, agent.color))
 
-    # NOTE: COLORS uses singular keys ("stock", "bond", "gold"), but the
-    # asset names used throughout the UI are plural ("Stocks", "Bonds",
-    # "Gold"). `COLORS[asset.lower()]` therefore raised a KeyError for
-    # "stocks" / "bonds" (only "gold" happens to match in both forms). Map
-    # explicitly instead of relying on a naming coincidence.
-    asset_color_map = {"Stocks": COLORS["stock"], "Bonds": COLORS["bond"], "Gold": COLORS["gold"]}
-
-    fig = go.Figure()
-    asset_list = ["Stocks", "Bonds", "Gold"]
-    for asset in asset_list:
+    fig = _fig(h=360, title=dict(text="Cumulative Net Demand by Agent (pp of allocation)", font=dict(size=14)))
+    for asset in ["Stocks","Bonds","Gold"]:
         fig.add_trace(go.Bar(
             name=asset,
-            x=[name for name, _, _ in net_by_agent_asset],
-            y=[totals[asset] * 100 for _, totals, _ in net_by_agent_asset],
-            marker_color=asset_color_map[asset],
+            x=[n for n,_,_ in net_by_agent],
+            y=[t[asset]*100 for _,t,_ in net_by_agent],
+            marker_color=asset_colors[asset],
         ))
-    fig.update_layout(
-        **PLOTLY_TEMPLATE["layout"],
-        title=dict(text="Cumulative Net Demand Pressure by Agent (percentage points of allocation)", font=dict(size=14)),
-        barmode="group",
-        xaxis_title="Agent",
-        yaxis_title="Net Allocation Change (pp, summed over run)",
-        height=380,
-    )
+    fig.update_layout(barmode="group", xaxis_title="Agent", yaxis_title="Net Allocation Change (pp)")
     st.plotly_chart(fig, use_container_width=True)
 
-
-def render_portfolio_chart(engine: SimulationEngine):
-    st.markdown("##### Agent Portfolio Value")
-    fig = go.Figure()
+def render_risk_contribution_chart(engine: SimulationEngine):
+    """Approximate risk contribution: each agent's portfolio vol × portfolio share."""
+    fig = _fig(h=300, title=dict(text="Risk Contribution by Agent (Approx. Realised Vol)", font=dict(size=14)))
     for agent in engine.agents:
+        pv = pd.Series(agent.portfolio_value_history)
+        vol = pv.pct_change().std() * 100
         fig.add_trace(go.Scatter(
             x=list(range(len(agent.portfolio_value_history))),
             y=agent.portfolio_value_history,
-            name=agent.name,
+            name=f"{agent.name} (σ={vol:.2f}%/p)",
             line=dict(color=agent.color, width=2),
         ))
-    fig.update_layout(
-        **PLOTLY_TEMPLATE["layout"],
-        title=dict(text="Portfolio Value by Agent (Start = 100)", font=dict(size=14)),
-        xaxis_title="Period",
-        yaxis_title="Portfolio Value",
-        height=380,
-        hovermode="x unified",
-    )
+    fig.update_layout(xaxis_title="Period", yaxis_title="Portfolio Value (Start=100)", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
+    # Vol table
+    c1, c2, c3 = st.columns(3)
+    for col, agent in zip([c1,c2,c3], engine.agents):
+        pv  = pd.Series(agent.portfolio_value_history)
+        vol = pv.pct_change().std() * 100
+        tr  = (pv.iloc[-1] / pv.iloc[0] - 1) * 100 if len(pv) > 1 else 0
+        col.markdown(f"<div class='panel' style='text-align:center;padding:.7rem .5rem;'>"
+                     f"<div class='metric-label' style='color:{agent.color};'>{agent.name}</div>"
+                     f"<div class='metric-value' style='font-size:1rem;'>Vol {vol:.2f}%/p</div>"
+                     f"<div class='metric-label' style='margin-top:.25rem;'>Total Return {tr:+.1f}%</div>"
+                     "</div>", unsafe_allow_html=True)
+
+def render_rulebook():
+    with st.expander("📋  Agent Decision Rules — Transparent Rule Engine", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(f"**Pension Fund** &nbsp;<span class='badge'>LDI</span><span class='badge'>Contrarian</span>", unsafe_allow_html=True)
+            for r in [
+                "IF funding ratio < 90% → emergency de-risk",
+                "IF funding ratio < 100% → increase bond matching",
+                "IF funding ratio > 120% → add return-seeking equities",
+                "IF equity–bond yield gap < 1.5pp → trim equities",
+                "IF yield gap > 5pp → add equities vs bonds",
+                "IF inflation > 5% → add gold as liability hedge",
+                "IF stocks fall >8% (5p) & funded → contrarian buy",
+                "IF regime = Recession → defensive shift",
+            ]:
+                st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
+        with c2:
+            st.markdown(f"**Hedge Fund** &nbsp;<span class='badge'>Trend</span><span class='badge'>Valuation</span><span class='badge'>Risk Budget</span>", unsafe_allow_html=True)
+            for r in [
+                "IF trend & valuation agree (bullish) → leveraged long",
+                "IF trend & valuation agree (bearish) → reduce / short",
+                "IF trend +ve but valuation expensive → half-size long",
+                "IF realised vol > risk budget → scale positions down",
+                "IF sentiment bullish → add leverage",
+                "IF rates > 5% → reduce financing cost exposure",
+                "IF recession / oil crisis → tactical gold",
+                "Track: gross exposure, net exposure, leverage ratio",
+            ]:
+                st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
+        with c3:
+            st.markdown(f"**Retail Investor** &nbsp;<span class='badge'>Fear/Greed</span><span class='badge'>News</span>", unsafe_allow_html=True)
+            for r in [
+                "Gains compound greed index; losses spike fear index",
+                "IF greed >> fear → euphoric buying / full equity",
+                "IF fear >> greed → panic selling / flee to cash",
+                "IF 5p drawdown > 6% → panic sell trigger",
+                "IF regime = Recession → amplified de-risking",
+                "News sensitivity multiplies all sentiment reactions",
+                "Fear & greed mean-revert each period (not permanent)",
+            ]:
+                st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
 
 def render_simulation_log(engine: SimulationEngine):
-    st.markdown("##### Simulation Log")
-    notable_logs = [log for log in engine.logs if log.details]
-    show_all = st.checkbox("Show every period (otherwise only periods with triggered rules)", value=False)
-    logs_to_show = engine.logs if show_all else notable_logs
+    notable = [l for l in engine.logs if l.details]
+    show_all = st.checkbox("Show all periods", value=False)
+    logs = engine.logs if show_all else notable
 
-    if not logs_to_show:
-        st.markdown(
-            f"<div class='log-line'>No threshold rules were triggered during this run — "
-            "the macro environment stayed within neutral ranges for every agent's rule set.</div>",
-            unsafe_allow_html=True,
-        )
+    if not logs:
+        st.markdown("<div class='log-line'>No threshold rules triggered this run.</div>", unsafe_allow_html=True)
         return
 
-    max_display = 40
-    display_logs = logs_to_show[-max_display:] if len(logs_to_show) > max_display else logs_to_show
-    if len(logs_to_show) > max_display:
-        st.caption(f"Showing most recent {max_display} of {len(logs_to_show)} matching periods.")
+    display = logs[-40:] if len(logs) > 40 else logs
+    if len(logs) > 40:
+        st.caption(f"Showing most recent 40 of {len(logs)} periods.")
 
-    log_html_parts = []
-    for log in display_logs:
-        lines = [f"<span class='log-period'>Period {log.period}.</span> {log.headline}."]
-        for d in log.details:
+    parts = []
+    for l in display:
+        regime_color = REGIME_COLORS.get(l.regime, C["text_dim"])
+        lines = [
+            f"<span class='log-period'>Period {l.period}</span> "
+            f"<span style='color:{regime_color};font-size:.72rem;'>[{l.regime}]</span> "
+            f"<span style='color:{C['text']};'>FR:{l.funding_ratio:.0f}%</span> — {l.headline}."
+        ]
+        for d in l.details:
             lines.append(f"&nbsp;&nbsp;↳ {d}")
         lines.append(
-            f"&nbsp;&nbsp;Stocks {log.stock_change:+.2f}% · Bonds {log.bond_change:+.2f}% · Gold {log.gold_change:+.2f}%"
+            f"&nbsp;&nbsp;Stocks {l.stock_change:+.2f}% · "
+            f"Bonds {l.bond_change:+.2f}% · Gold {l.gold_change:+.2f}%"
         )
-        log_html_parts.append("<div class='log-line'>" + "<br>".join(lines) + "</div><br>")
+        parts.append("<div class='log-line'>" + "<br>".join(lines) + "</div><br>")
 
     st.markdown(
-        f"<div class='panel-card' style='max-height:420px;overflow-y:auto;'>" + "".join(log_html_parts) + "</div>",
-        unsafe_allow_html=True,
-    )
-
-
-def render_summary_stats(engine: SimulationEngine):
-    market = engine.market
-    cols = st.columns(3)
-    for col, asset_name in zip(cols, ["Stocks", "Bonds", "Gold"]):
-        asset = market.assets[asset_name]
-        total_ret = asset.total_return_pct()
-        color = COLORS["accent_green"] if total_ret >= 0 else COLORS["accent_red"]
-        col.markdown(
-            f"<div class='panel-card' style='text-align:center;'>"
-            f"<div class='metric-label'>{asset_name} — Total Return</div>"
-            f"<div style='font-size:1.6rem;font-family:monospace;color:{color};margin-top:0.2rem;'>{total_ret:+.1f}%</div>"
-            f"<div class='metric-label' style='margin-top:0.3rem;'>Final Level: {asset.price:.2f}</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
+        f"<div class='panel' style='max-height:420px;overflow-y:auto;'>" + "".join(parts) + "</div>",
+        unsafe_allow_html=True)
 
 def render_institutional_panel(engine: SimulationEngine):
     st.markdown("### Institutional Analysis")
     summary = generate_institutional_summary(engine)
     st.markdown(
-        f"<div class='panel-card' style='line-height:1.65;font-size:0.95rem;'>"
-        + summary.replace("\n\n", "<br><br>")
-        + "</div>",
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        "Generated entirely from this simulation's own price, demand, and allocation arrays. "
-        "No external AI API is used to produce this text."
-    )
+        f"<div class='panel' style='line-height:1.7;font-size:.93rem;font-family:IBM Plex Sans,sans-serif;'>"
+        + summary.replace("\n\n","<br><br>") + "</div>",
+        unsafe_allow_html=True)
+    st.caption("Generated entirely from simulation arrays — no external AI API.")
 
-
-# ==================================================================================
-# MAIN APP FLOW
-# ==================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     init_session_state()
@@ -1431,49 +1438,82 @@ def main():
     render_header()
 
     engine: Optional[SimulationEngine] = st.session_state.get("engine")
-
-    render_agent_rulebook()
-
+    render_rulebook()
     st.markdown("---")
 
     if engine is None:
         st.markdown(
-            f"<div class='panel-card' style='text-align:center;padding:3rem 1rem;'>"
-            f"<div style='font-size:1.1rem;color:{COLORS['text_dim']};'>"
-            "No simulation has been run yet.<br>Configure the market environment in the sidebar "
-            "and click <b>RUN SIMULATION</b>, or choose a scenario preset.</div></div>",
-            unsafe_allow_html=True,
-        )
+            f"<div class='panel' style='text-align:center;padding:3rem 1rem;'>"
+            f"<div style='font-size:1.05rem;color:{C['text_dim']};'>"
+            "No simulation running.<br>Set parameters in the sidebar and click "
+            "<b>RUN SIMULATION</b>, or choose a scenario preset.</div></div>",
+            unsafe_allow_html=True)
         return
 
+    # ── 1 · Environment ───────────────────────────────────────────────────────
     st.markdown("### 1 · Market Environment")
-    render_environment_summary(engine)
+    render_env_strip(engine)
 
-    st.markdown("### 2 · Simulation Results")
-    render_summary_stats(engine)
+    # ── 2 · Market Regimes ────────────────────────────────────────────────────
+    st.markdown("### 2 · Market Regimes")
+    render_regime_chart(engine)
+
+    # ── 3 · Valuations & Expected Returns ────────────────────────────────────
+    st.markdown("### 3 · Asset Valuations & Expected Returns")
+    render_valuation_chart(engine)
+
+    # ── 4 · Price Results ────────────────────────────────────────────────────
+    st.markdown("### 4 · Simulation Results")
+    render_summary_metrics(engine)
     render_price_chart(engine)
 
     st.markdown("---")
-    st.markdown("### 3 · Investor Agents")
-    render_allocation_chart(engine)
-    render_demand_chart(engine)
-    render_portfolio_chart(engine)
+
+    # ── 5 · Pension Fund Dashboard ───────────────────────────────────────────
+    st.markdown("### 5 · Pension Fund — Liability-Driven Dashboard")
+    render_funding_ratio_chart(engine)
 
     st.markdown("---")
-    st.markdown("### 4 · Simulation Log")
+
+    # ── 6 · Hedge Fund Dashboard ─────────────────────────────────────────────
+    st.markdown("### 6 · Hedge Fund — Exposure & Signal Dashboard")
+    render_hedge_fund_dashboard(engine)
+
+    st.markdown("---")
+
+    # ── 7 · Retail Investor Dashboard ────────────────────────────────────────
+    st.markdown("### 7 · Retail Investor — Fear / Greed Dashboard")
+    render_fear_greed_chart(engine)
+
+    st.markdown("---")
+
+    # ── 8 · Agent Allocations & Demand ──────────────────────────────────────
+    st.markdown("### 8 · Agent Allocations & Market Demand")
+    render_allocation_chart(engine)
+    render_demand_chart(engine)
+
+    st.markdown("---")
+
+    # ── 9 · Risk Contributions ───────────────────────────────────────────────
+    st.markdown("### 9 · Risk Contributions & Portfolio Performance")
+    render_risk_contribution_chart(engine)
+
+    st.markdown("---")
+
+    # ── 10 · Simulation Log ──────────────────────────────────────────────────
+    st.markdown("### 10 · Simulation Log")
     render_simulation_log(engine)
 
     st.markdown("---")
+
+    # ── 11 · Institutional Narrative ─────────────────────────────────────────
     render_institutional_panel(engine)
 
     st.markdown("---")
     st.caption(
-        "Agent Twin is a pedagogical / illustrative simulation. Agent rules, sensitivities, and "
-        "pricing mechanics are simplified by design to make the link between investor behavior "
-        "and price formation transparent. This is not investment advice and does not forecast "
-        "real markets."
+        "Agent Twin v2 is a pedagogical simulator. Rules, sensitivities and pricing mechanics "
+        "are simplified to keep agent behaviour transparent. Not investment advice."
     )
-
 
 if __name__ == "__main__":
     main()
