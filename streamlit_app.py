@@ -1698,16 +1698,15 @@ def render_monte_carlo_section():
                 f"</div>",
                 unsafe_allow_html=True)
 
-    # ── Part 4: Economic Dominance Score ─────────────────────────────────────
+# ── Part 4: Economic Dominance Score ─────────────────────────────────────
 st.markdown("---")
-st.markdown("##### 📊  Economic Dominance Score")
+st.markdown("##### 📊 Economic Dominance Score")
 
-# Use the single-run engine if available; otherwise run seed 0
 engine = st.session_state.get("engine")
+
 if engine is None:
-env_ed = _make_env()
-    engine = SimulationEngine(env_ed, periods=st.session_state["periods"], seed=0)
-    engine.run()
+    run_simulation()
+    engine = st.session_state["engine"]
 
 dom = compute_economic_dominance(engine)
 
@@ -1721,15 +1720,19 @@ if dom["r2"] is not None:
         f"<div class='panel' style='text-align:center;padding:.7rem;'>"
         f"<div class='metric-label'>Economic Signal Strength</div>"
         f"<div class='metric-value'>{sig:.1f}%</div>"
-        f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div></div>",
-        unsafe_allow_html=True)
+        f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 
     col2.markdown(
         f"<div class='panel' style='text-align:center;padding:.7rem;'>"
         f"<div class='metric-label'>Noise Contribution</div>"
         f"<div class='metric-value'>{noise:.1f}%</div>"
-        f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div></div>",
-        unsafe_allow_html=True)
+        f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 
     r2_bars = dom.get("asset_r2", {})
 
@@ -1742,42 +1745,56 @@ if dom["r2"] is not None:
             for a, v in r2_bars.items()
         )
         + "</div>",
-        unsafe_allow_html=True)
+        unsafe_allow_html=True
+    )
 
     if dom["warning"]:
         st.markdown(
             f"<div style='background:#3d1210;border:1px solid {C['red']};border-radius:6px;padding:.7rem 1rem;margin-top:.5rem;'>"
             f"<span style='color:{C['red']};font-family:monospace;font-weight:700;'>⚠ NOISE DOMINANCE WARNING</span>"
-            f"<span style='color:{C['text_dim']};font-size:.85rem;font-family:monospace;'> — Noise explains {noise:.1f}% of variance. "
-            "Economic fundamentals are insufficiently dominant. Consider reducing stochastic noise parameters or increasing simulation length.</span>"
-            "</div>",
-            unsafe_allow_html=True)
+            f"<span style='color:{C['text_dim']};font-size:.85rem;font-family:monospace;'> — Noise explains {noise:.1f}% of variance. Economic fundamentals are insufficiently dominant.</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
     else:
         st.markdown(
             f"<div style='background:{C['green_dim']};border:1px solid {C['green']};border-radius:6px;padding:.5rem 1rem;margin-top:.5rem;'>"
             f"<span style='color:{C['green']};font-family:monospace;font-size:.85rem;'>✓ Economic fundamentals are sufficiently dominant ({sig:.1f}% of variance explained).</span>"
-            "</div>",
-            unsafe_allow_html=True)
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
-    # Small bar chart
-    fig_dom = _fig(h=200, title=dict(text="Per-Asset: Economic Signal vs Noise", font=dict(size=12)))
+    fig_dom = _fig(
+        h=200,
+        title=dict(
+            text="Per-Asset: Economic Signal vs Noise",
+            font=dict(size=12)
+        )
+    )
+
     assets_list = list(r2_bars.keys())
     sig_vals = [r2_bars[a] * 100 for a in assets_list]
     noise_vals = [100 - v for v in sig_vals]
 
-    fig_dom.add_trace(go.Bar(
-        x=assets_list,
-        y=sig_vals,
-        name="Signal",
-        marker_color=C["green"],
-        opacity=0.8))
+    fig_dom.add_trace(
+        go.Bar(
+            x=assets_list,
+            y=sig_vals,
+            name="Signal",
+            marker_color=C["green"],
+            opacity=0.8
+        )
+    )
 
-    fig_dom.add_trace(go.Bar(
-        x=assets_list,
-        y=noise_vals,
-        name="Noise",
-        marker_color=C["red"],
-        opacity=0.6))
+    fig_dom.add_trace(
+        go.Bar(
+            x=assets_list,
+            y=noise_vals,
+            name="Noise",
+            marker_color=C["red"],
+            opacity=0.6
+        )
+    )
 
     fig_dom.update_layout(
         barmode="stack",
