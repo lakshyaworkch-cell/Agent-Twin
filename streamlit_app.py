@@ -1731,7 +1731,7 @@ def render_monte_carlo_section():
         col1.markdown(
             f"<div class='panel' style='text-align:center;padding:.7rem;'>"
             f"<div class='metric-label'>Economic Signal Strength</div>"
-            f"<div class='metric-value' style='color:{C[\"green\"] if sig > 40 else C[\"amber\"] if sig > 25 else C[\"red\"]};'>{sig:.1f}%</div>"
+            color = C["green"] if sig > 40 else C["amber"] if sig > 25 else C["red"]
             f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div></div>",
             unsafe_allow_html=True)
         col2.markdown(
