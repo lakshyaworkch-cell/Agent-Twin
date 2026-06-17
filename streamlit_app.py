@@ -1759,12 +1759,23 @@ def render_monte_carlo_section():
             + "</div>",
             unsafe_allow_html=True)
 
+        c_red      = C["red"]
+        c_text_dim = C["text_dim"]
+        c_green    = C["green"]
+        c_green_dim = C["green_dim"]
+
         if dom["warning"]:
             st.markdown(
-                f"<div style='background:#3d1210;border:1px solid {C[\"red\"]};border-radius:6px;padding:.7rem 1rem;margin-top:.5rem;'>"
-                f"<span style='color:{C[\"red\"]};font-family:monospace;font-weight:700;'>⚠ NOISE DOMINANCE WARNING</span>"
-                f"<span style='color:{C[\"text_dim\"]};font-size:.85rem;font-family:monospace;'> — Noise explains {noise:.1f}% of variance. "
+                f"<div style='background:#3d1210;border:1px solid {c_red};border-radius:6px;padding:.7rem 1rem;margin-top:.5rem;'>"
+                f"<span style='color:{c_red};font-family:monospace;font-weight:700;'>⚠ NOISE DOMINANCE WARNING</span>"
+                f"<span style='color:{c_text_dim};font-size:.85rem;font-family:monospace;'> — Noise explains {noise:.1f}% of variance. "
                 "Economic fundamentals are insufficiently dominant. Consider reducing stochastic noise parameters or increasing simulation length.</span>"
+                "</div>",
+                unsafe_allow_html=True)
+        else:
+            st.markdown(
+                f"<div style='background:{c_green_dim};border:1px solid {c_green};border-radius:6px;padding:.5rem 1rem;margin-top:.5rem;'>"
+                f"<span style='color:{c_green};font-family:monospace;font-size:.85rem;'>✓ Economic fundamentals are sufficiently dominant ({sig:.1f}% of variance explained).</span>"
                 "</div>",
                 unsafe_allow_html=True)
         else:
