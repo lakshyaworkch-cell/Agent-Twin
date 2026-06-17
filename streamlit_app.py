@@ -1745,12 +1745,15 @@ def render_monte_carlo_section():
             unsafe_allow_html=True)
 
         r2_bars = dom.get("asset_r2", {})
+        def _r2_color(v):
+            return C["green"] if v > 0.35 else C["amber"] if v > 0.2 else C["red"]
+
         col3.markdown(
             f"<div class='panel' style='text-align:center;padding:.7rem;'>"
             f"<div class='metric-label'>Per-Asset R²</div>"
             + "".join(
                 f"<div style='font-family:monospace;font-size:.85rem;margin-top:.2rem;'>"
-                f"{a}: <span style='color:{C[\"green\"] if v>0.35 else C[\"amber\"] if v>0.2 else C[\"red\"]};'>{v*100:.1f}%</span></div>"
+                f"{a}: <span style='color:{_r2_color(v)};'>{v*100:.1f}%</span></div>"
                 for a, v in r2_bars.items()
             )
             + "</div>",
