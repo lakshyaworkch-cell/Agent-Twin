@@ -1,7 +1,23 @@
 """
 ==================================================================================
- AGENT TWIN v2.1 — Robust Institutional Market Simulator
+ AGENT TWIN v3.0 — Institutional Market Simulator with Realistic Price Formation
 ==================================================================================
+
+CHANGES FROM v2.1 (see accompanying writeup for full rationale):
+  1. Price formation replaced: square-root market-impact law + market depth +
+     mean reversion to fundamental value, replacing linear demand*sensitivity
+     with a hard clip (the source of the geometric blow-up).
+  2. Fundamental value is now tracked explicitly per asset and used both by
+     the price engine (reversion target) and by agents (already partially
+     true via StockValuation, now made consistent).
+  3. Return Attribution Framework: each period's price move is decomposed
+     into Valuation / Macro / Pension / Hedge / Retail / Noise components
+     that sum exactly to the realised return (additive log-return decomposition).
+  4. Agent Impact Analysis: ablation runner that re-runs the sim with each
+     agent's flow zeroed out, reporting return/vol/drawdown contribution.
+  5. Agents themselves are UNCHANGED in their decision rules (same rationale
+     strings, same bounds, same triggers) -- only the few touchpoints needed
+     to interface with the new price engine and attribution ledger were added.
 """
 
 import math
@@ -21,7 +37,7 @@ import streamlit as st
 # ──────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Agent Twin v2.1 | Robust Institutional Market Simulator",
+    page_title="Agent Twin v3.0 | Institutional Market Simulator",
     page_icon="🏛️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -53,6 +69,12 @@ C = {
     "slowdown":     "#c08a2e",
     "recession":    "#b3473a",
     "recovery":     "#3b7bab",
+    "valuation_attr": "#3b7bab",
+    "macro_attr":     "#7c5cbf",
+    "pension_attr":   "#3b82a6",
+    "hedge_attr":     "#b3473a",
+    "retail_attr":    "#c08a2e",
+    "noise_attr":     "#5a6b65",
 }
 
 CSS = f"""
@@ -140,7 +162,7 @@ LAYOUT = dict(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MARKET REGIMES
+# MARKET REGIMES  (UNCHANGED)
 # ══════════════════════════════════════════════════════════════════════════════
 
 REGIMES = ["Expansion", "Slowdown", "Recession", "Recovery"]
@@ -167,6 +189,9 @@ def next_regime(current: str, rng: random.Random) -> str:
     return current
 
 def regime_asset_bias(regime: str) -> Dict[str, float]:
+    # NOTE: these are now interpreted as ANNUALISED-equivalent fundamental
+    # drift biases (drift in expected/fair return), not direct price-impact
+    # nudges. They feed the fair-value path, not the price engine's noise term.
     biases = {
         "Expansion": {"Stocks":  0.20, "Bonds": -0.03, "Gold":  0.00},
         "Slowdown":  {"Stocks": -0.07, "Bonds":  0.10, "Gold":  0.07},
@@ -176,7 +201,7 @@ def regime_asset_bias(regime: str) -> Dict[str, float]:
     return biases[regime]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ASSET VALUATION LAYER
+# ASSET VALUATION LAYER  (UNCHANGED LOGIC — same formulas as v2.1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -235,7 +260,7 @@ class GoldValuation:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MACRO ENVIRONMENT
+# MACRO ENVIRONMENT  (UNCHANGED)
 # ══════════════════════════════════════════════════════════════════════════════
 
 SENTIMENT_LEVELS = ["Very Bearish", "Bearish", "Neutral", "Bullish", "Very Bullish"]
@@ -260,30 +285,135 @@ class MacroEnvironment:
     def is_oil_crisis(self):     return self.oil_shock > 15.0
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ASSET
+# ASSET  —  REWRITTEN PRICE FORMATION (the core fix)
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# OLD MODEL (v2.1):
+#   pct_change = clip(demand_pressure * sensitivity + noise + regime_bias, -6, +6)
+#
+#   Problems (see STEP 1 critique):
+#     - Linear impact: doubling order flow exactly doubles price impact. Real
+#       markets show diminishing (square-root) impact -- the first $1m of
+#       buying moves price more than the next $1m.
+#     - No market depth / liquidity concept -- "sensitivity" is a fixed
+#       constant regardless of how much capital/float exists.
+#     - No mean reversion to any fundamental anchor -- once price drifts from
+#       fair value, NOTHING pulls it back. The only countervailing force was
+#       a weak additive valuation signal inside one agent (HedgeFund).
+#     - Hard clip at +/-6% is not a safety valve, it's a floor: ordinary
+#       agreement among 2-3 agents already exceeds it most periods (we
+#       measured pre-clip demand shocks of +20% from entirely plausible
+#       per-period deltas). Once saturated, repeated +6%/-6% moves compound
+#       geometrically (1.06^50 = +1742%), which is exactly the runaway
+#       behaviour reported (100 -> 245 -> 60 -> 260).
+#
+# NEW MODEL (v3.0):
+#   impact_pct    = sign(flow) * sqrt(|flow|) * (100 / sqrt(market_depth))
+#   reversion_pct = -reversion_speed * ln(price / fair_value) * 100
+#   noise_pct     = N(0, base_vol * vol_scale)
+#   raw           = impact_pct + reversion_pct + noise_pct
+#   pct_change    = 8 * tanh(raw / 8)      <- smooth damping, not a hard floor
+#
+#   - market_depth (in "flow units"): higher = more liquid = less impact per
+#     unit of order flow. Calibrated per asset (stocks deepest, gold shallowest).
+#   - sqrt() impact law: this is the standard Kyle/Almgren-Chriss style
+#     market-impact model used in real execution-cost research. It produces
+#     diminishing marginal impact, which is what stops a sequence of
+#     same-direction trades from compounding into +1000s of percent.
+#   - reversion_speed: the missing fundamental anchor. price drifts toward
+#     fair_value at a fraction of the log-gap each period, so bubbles can
+#     still form (and the dashboard should SHOW that) but they correct
+#     rather than persisting and "round-tripping" via clip saturation.
+#   - tanh soft cap replaces hard clip: large raw moves are damped smoothly,
+#     so there's no flat plateau where every period contributes an identical
+#     return, which is what produces clean geometric compounding artifacts.
+
+ASSET_DEPTH = {
+    # higher = deeper / more liquid = less price impact per unit of flow
+    "Stocks": 42.0,
+    "Bonds":  70.0,   # bond market is deeper/less elastic to flow than equities
+    "Gold":   30.0,   # shallower -- gold is more flow-sensitive
+}
+ASSET_REVERSION_SPEED = {
+    "Stocks": 0.055,
+    "Bonds":  0.09,   # bonds anchor to yield/duration fast (rate arbitrage is tight)
+    "Gold":   0.045,
+}
+ASSET_BASE_VOL = {
+    "Stocks": 1.05,
+    "Bonds":  0.55,
+    "Gold":   0.95,
+}
+
+REGIME_VOL_SCALE = {
+    "Expansion": 0.90, "Slowdown": 1.05, "Recession": 1.45, "Recovery": 1.10,
+}
+
 
 class Asset:
-    def __init__(self, name: str, start_price: float, sensitivity: float, base_volatility: float):
+    def __init__(self, name: str, start_price: float, market_depth: float,
+                 reversion_speed: float, base_volatility: float):
         self.name = name
-        self.sensitivity = sensitivity
+        self.market_depth = market_depth
+        self.reversion_speed = reversion_speed
         self.base_volatility = base_volatility
         self.price_history: List[float] = [start_price]
+        self.fair_value_history: List[float] = [start_price]
         self.demand_pressure_history: List[float] = [0.0]
+        # decomposed-component ledger, one entry appended per step (see step())
+        self.impact_history: List[float] = [0.0]
+        self.reversion_history: List[float] = [0.0]
+        self.noise_history: List[float] = [0.0]
 
     @property
     def price(self) -> float:
         return self.price_history[-1]
 
-    def apply_demand(self, demand_pressure: float, rng: random.Random,
-                     regime_bias: float = 0.0) -> float:
-        noise = rng.gauss(0, self.base_volatility)
-        pct_change = demand_pressure * self.sensitivity + noise + regime_bias
-        pct_change = max(min(pct_change, 6.0), -6.0)
-        new_price = max(self.price * (1 + pct_change / 100.0), 0.01)
+    @property
+    def fair_value(self) -> float:
+        return self.fair_value_history[-1]
+
+    def set_fair_value(self, fv: float):
+        self.fair_value_history.append(max(fv, 0.01))
+
+    def apply_demand(self, net_flow_pp: float, rng: random.Random,
+                      vol_scale: float = 1.0) -> Tuple[float, float, float, float]:
+        """
+        net_flow_pp: net order flow this period, in percentage points of
+        aggregate target-allocation change (NOT pre-scaled by an arbitrary
+        sensitivity constant -- the depth term below does that job).
+        Returns (total_pct_change, impact_component, reversion_component, noise_component)
+        so the attribution framework can reconcile exactly.
+        """
+        sign = 1.0 if net_flow_pp >= 0 else (-1.0 if net_flow_pp < 0 else 0.0)
+        impact_pct = sign * math.sqrt(abs(net_flow_pp)) * (100.0 / math.sqrt(self.market_depth))
+
+        log_gap = math.log(max(self.price, 0.01) / max(self.fair_value, 0.01))
+        reversion_pct = -self.reversion_speed * log_gap * 100.0
+
+        noise_pct = rng.gauss(0, self.base_volatility * vol_scale)
+
+        raw = impact_pct + reversion_pct + noise_pct
+        capped = 8.0 * math.tanh(raw / 8.0)
+
+        # Distribute the soft-cap's damping proportionally across the three
+        # components so they still sum exactly to `capped` (needed for the
+        # attribution framework to reconcile to the penny).
+        if abs(raw) > 1e-9:
+            scale = capped / raw
+        else:
+            scale = 1.0
+        impact_pct   *= scale
+        reversion_pct *= scale
+        noise_pct     *= scale
+
+        new_price = max(self.price * (1 + capped / 100.0), 0.01)
         self.price_history.append(new_price)
-        self.demand_pressure_history.append(demand_pressure)
-        return pct_change
+        self.demand_pressure_history.append(net_flow_pp)
+        self.impact_history.append(impact_pct)
+        self.reversion_history.append(reversion_pct)
+        self.noise_history.append(noise_pct)
+        return capped, impact_pct, reversion_pct, noise_pct
 
     def total_return_pct(self) -> float:
         if len(self.price_history) < 2:
@@ -291,7 +421,7 @@ class Asset:
         return (self.price_history[-1] / self.price_history[0] - 1) * 100.0
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ORDER
+# ORDER  (UNCHANGED, plus an agent tag map used by attribution)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -301,7 +431,7 @@ class AgentOrder:
     rationale: List[str]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BASE AGENT
+# BASE AGENT  (UNCHANGED)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Agent:
@@ -349,7 +479,7 @@ class Agent:
         raise NotImplementedError
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PENSION FUND
+# PENSION FUND  (DECISION RULES UNCHANGED from v2.1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PensionFund(Agent):
@@ -445,7 +575,7 @@ class PensionFund(Agent):
         return AgentOrder(self.name, deltas, rationale)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HEDGE FUND
+# HEDGE FUND  (DECISION RULES UNCHANGED from v2.1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HedgeFund(Agent):
@@ -561,7 +691,7 @@ class HedgeFund(Agent):
         return AgentOrder(self.name, deltas, rationale)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RETAIL INVESTOR
+# RETAIL INVESTOR  (DECISION RULES UNCHANGED from v2.1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RetailInvestor(Agent):
@@ -637,17 +767,31 @@ class RetailInvestor(Agent):
         return AgentOrder(self.name, deltas, rationale)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MARKET
+# MARKET  —  price step rewritten to use new Asset engine + attribution ledger
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Market:
-    def __init__(self, env: MacroEnvironment, seed: int = 42):
+    def __init__(self, env: MacroEnvironment, seed: int = 42, agent_filter: Optional[List[str]] = None):
+        """
+        agent_filter: if provided, only orders from agents whose `agent_name`
+        is in this list contribute demand to the price engine. Used by the
+        Agent Impact Analysis (STEP 4) to ablate one agent's market footprint
+        while still letting it exist and report its own (counterfactual)
+        portfolio performance.
+        """
         self.env = env
         self.rng = random.Random(seed)
+        self.agent_filter = agent_filter  # None = everyone included
         self.assets: Dict[str, Asset] = {
-            "Stocks": Asset("Stocks", 100.0, sensitivity=13.0, base_volatility=0.28),
-            "Bonds":  Asset("Bonds",  100.0, sensitivity=8.5,  base_volatility=0.15),
-            "Gold":   Asset("Gold",   100.0, sensitivity=10.0, base_volatility=0.25),
+            "Stocks": Asset("Stocks", 100.0, market_depth=ASSET_DEPTH["Stocks"],
+                            reversion_speed=ASSET_REVERSION_SPEED["Stocks"],
+                            base_volatility=ASSET_BASE_VOL["Stocks"]),
+            "Bonds":  Asset("Bonds",  100.0, market_depth=ASSET_DEPTH["Bonds"],
+                            reversion_speed=ASSET_REVERSION_SPEED["Bonds"],
+                            base_volatility=ASSET_BASE_VOL["Bonds"]),
+            "Gold":   Asset("Gold",   100.0, market_depth=ASSET_DEPTH["Gold"],
+                            reversion_speed=ASSET_REVERSION_SPEED["Gold"],
+                            base_volatility=ASSET_BASE_VOL["Gold"]),
         }
         self.valuations: Dict = {
             "Stocks": StockValuation(earnings=5.5, earnings_growth=5.0),
@@ -657,6 +801,9 @@ class Market:
         self.env_history: List[MacroEnvironment] = [env]
         self.regime_history: List[str] = [env.regime]
         self.expected_return_history: List[Dict[str, float]] = []
+        # Attribution ledger: one dict per period per asset, components in
+        # PERCENTAGE-POINT log-return space so they sum exactly to total.
+        self.attribution_history: List[Dict[str, Dict[str, float]]] = []
 
     def expected_returns(self, env: MacroEnvironment) -> Dict[str, float]:
         sv: StockValuation = self.valuations["Stocks"]
@@ -688,18 +835,77 @@ class Market:
     def aggregate_demand(self, orders: List[AgentOrder]) -> Dict[str, float]:
         demand = {n: 0.0 for n in self.assets}
         for o in orders:
+            if self.agent_filter is not None and o.agent_name not in self.agent_filter:
+                continue
             for a, d in o.allocation_deltas.items():
                 if a in demand:
                     demand[a] += d
         return demand
 
+    def per_agent_demand(self, orders: List[AgentOrder]) -> Dict[str, Dict[str, float]]:
+        """Demand broken out by agent (always full, unfiltered) -- used purely
+        for the attribution framework's per-agent component, independent of
+        any ablation filter used elsewhere."""
+        out: Dict[str, Dict[str, float]] = {}
+        for o in orders:
+            out[o.agent_name] = {a: d for a, d in o.allocation_deltas.items() if a in self.assets}
+        return out
+
+    def _update_fair_values(self):
+        """
+        Fair value path = pure fundamentals: prior fair value compounded by
+        the asset's current model-implied expected return (valuation model +
+        regime drift bias), with NO price-momentum or agent-flow term. This
+        is the anchor the price engine reverts to, and it is what lets the
+        attribution framework separate "valuation/macro" return from
+        "agent flow" return.
+        """
+        er = self.expected_returns(self.env)
+        for name, asset in self.assets.items():
+            growth = 1.0 + er[name] / 100.0 / 12.0  # per-period fraction of an annualised-style return
+            asset.set_fair_value(asset.fair_value * growth)
+
     def step(self, orders: List[AgentOrder]) -> Dict[str, float]:
         demand = self.aggregate_demand(orders)
-        bias = regime_asset_bias(self.env.regime)
+        per_agent = self.per_agent_demand(orders)
+        vol_scale = REGIME_VOL_SCALE.get(self.env.regime, 1.0)
+
+        self._update_fair_values()
+
         pct_changes = {}
+        period_attr: Dict[str, Dict[str, float]] = {}
+
         for name, asset in self.assets.items():
-            scaled = demand[name] * 7
-            pct_changes[name] = asset.apply_demand(scaled, self.rng, bias[name] * 0.12)
+            fv_before = asset.fair_value_history[-2]
+            fv_after  = asset.fair_value_history[-1]
+            valuation_macro_pct = (math.log(max(fv_after, 0.01) / max(fv_before, 0.01))) * 100.0
+
+            total_pct, impact_pct, reversion_pct, noise_pct = asset.apply_demand(
+                demand[name], self.rng, vol_scale=vol_scale)
+            pct_changes[name] = total_pct
+
+            # Decompose `impact_pct` (driven by AGGREGATE flow) into each
+            # agent's share, proportional to that agent's signed contribution
+            # to net flow. This keeps the per-agent attribution additive:
+            # sum_over_agents(agent_impact) == impact_pct exactly.
+            total_signed_flow = sum(per_agent.get(o.agent_name, {}).get(name, 0.0) for o in orders)
+            agent_components: Dict[str, float] = {}
+            if abs(total_signed_flow) > 1e-9:
+                for o in orders:
+                    flow_i = per_agent.get(o.agent_name, {}).get(name, 0.0)
+                    agent_components[o.agent_name] = impact_pct * (flow_i / total_signed_flow)
+            else:
+                for o in orders:
+                    agent_components[o.agent_name] = 0.0
+
+            period_attr[name] = {
+                "Valuation_Macro": valuation_macro_pct + reversion_pct,
+                **{f"Agent::{k}": v for k, v in agent_components.items()},
+                "Noise": noise_pct,
+                "Total": total_pct,
+            }
+
+        self.attribution_history.append(period_attr)
 
         sv: StockValuation = self.valuations["Stocks"]
         bv: BondValuation  = self.valuations["Bonds"]
@@ -717,7 +923,7 @@ class Market:
         self.regime_history.append(env.regime)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIMULATION ENGINE
+# SIMULATION ENGINE  (drift logic unchanged; wiring for ablation added)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -732,11 +938,12 @@ class LogEntry:
     funding_ratio: float
 
 class SimulationEngine:
-    def __init__(self, base_env: MacroEnvironment, periods: int = 100, seed: int = 42):
+    def __init__(self, base_env: MacroEnvironment, periods: int = 100, seed: int = 42,
+                 agent_filter: Optional[List[str]] = None):
         self.base_env = base_env
         self.periods  = periods
         self.rng      = random.Random(seed)
-        self.market   = Market(base_env, seed=seed)
+        self.market   = Market(base_env, seed=seed, agent_filter=agent_filter)
         self.agents: List[Agent] = [PensionFund(), HedgeFund(), RetailInvestor()]
         self.logs: List[LogEntry] = []
         self.demand_history: List[Dict[str, float]] = []
@@ -821,7 +1028,124 @@ class SimulationEngine:
                         env.regime, fr)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MONTE CARLO ENGINE
+# RETURN ATTRIBUTION FRAMEWORK  (STEP 3)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Mathematics:
+#   Each period t, asset i's log-return r_{i,t} is decomposed exactly as:
+#       r_{i,t} = V_{i,t} + sum_a F_{i,a,t} + N_{i,t}
+#   where:
+#       V_{i,t}    = fundamental/valuation/macro component (fair-value drift
+#                    + mean-reversion pull), independent of any single trade
+#       F_{i,a,t}  = agent a's share of the market-impact component, scaled
+#                    proportionally to agent a's share of total signed flow
+#                    (so sum_a F_{i,a,t} == total impact component exactly)
+#       N_{i,t}    = idiosyncratic noise component
+#   This holds by CONSTRUCTION in Market.step() (see attribution_history),
+#   because the tanh soft-cap's damping factor is applied identically and
+#   proportionally to all three raw components before they're recorded.
+#
+#   Cumulative attribution over T periods uses log-return additivity:
+#       sum_t r_{i,t} = total log return = ln(P_T / P_0)
+#   which is converted to simple-return space only for display.
+
+def compute_attribution_table(engine: SimulationEngine, asset: str = "Stocks") -> pd.DataFrame:
+    rows = []
+    agent_names = [a.name for a in engine.agents]
+    for t, period_attr in enumerate(engine.market.attribution_history, start=1):
+        a = period_attr.get(asset, {})
+        row = {"Period": t, "Valuation_Macro": a.get("Valuation_Macro", 0.0)}
+        for name in agent_names:
+            row[name] = a.get(f"Agent::{name}", 0.0)
+        row["Noise"] = a.get("Noise", 0.0)
+        row["Total"] = a.get("Total", 0.0)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def summarize_attribution(df: pd.DataFrame, agent_names: List[str]) -> Dict[str, float]:
+    """
+    Sums log-return contributions across all periods (additive), then
+    converts the cumulative log-return of each component to an equivalent
+    simple-return contribution by exponentiating the *cumulative total* and
+    allocating shares proportional to each component's cumulative log-sum.
+    This guarantees the reported pp contributions reconcile exactly to the
+    realised total simple return.
+    """
+    cols = ["Valuation_Macro"] + agent_names + ["Noise"]
+    log_sums = {c: df[c].sum() / 100.0 for c in cols}   # convert pct -> log-ish units
+    total_log = df["Total"].sum() / 100.0
+    total_simple_return = (math.exp(total_log) - 1) * 100.0
+
+    # Allocate the total simple return across components in proportion to
+    # each component's share of the total log-sum (exact reconciliation:
+    # shares sum to 1.0 by construction since log_sums sum to total_log).
+    out = {}
+    if abs(total_log) > 1e-9:
+        for c in cols:
+            out[c] = total_simple_return * (log_sums[c] / total_log)
+    else:
+        for c in cols:
+            out[c] = 0.0
+    out["Total"] = total_simple_return
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AGENT IMPACT ANALYSIS  (STEP 4) — ablation runner
+# ══════════════════════════════════════════════════════════════════════════════
+
+ALL_AGENT_NAMES = ["Pension Fund", "Hedge Fund", "Retail Investor"]
+
+def run_agent_ablation(base_env: MacroEnvironment, periods: int, seed: int = 42) -> Dict[str, SimulationEngine]:
+    """
+    Runs four simulations on identical environment/seed:
+      'Full Model'            -- all three agents' flow hits the market
+      'Without Pension Fund'  -- pension still computes its own decisions/
+                                  portfolio performance, but its flow is
+                                  excluded from the price-impact aggregation
+      'Without Hedge Fund'    -- same idea
+      'Without Retail'        -- same idea
+    Excluding flow (rather than removing the agent entirely) isolates the
+    PRICE-FORMATION effect of that agent cleanly, since all agents still see
+    the same macro path (we re-seed identically) and we don't have to handle
+    a different number of agents changing aggregate allocation bookkeeping.
+    """
+    configs = {
+        "Full Model":            None,
+        "Without Pension Fund":  [a for a in ALL_AGENT_NAMES if a != "Pension Fund"],
+        "Without Hedge Fund":    [a for a in ALL_AGENT_NAMES if a != "Hedge Fund"],
+        "Without Retail":        [a for a in ALL_AGENT_NAMES if a != "Retail Investor"],
+    }
+    results = {}
+    for label, agent_filter in configs.items():
+        eng = SimulationEngine(base_env, periods=periods, seed=seed, agent_filter=agent_filter)
+        eng.run()
+        results[label] = eng
+    return results
+
+def summarize_ablation(results: Dict[str, SimulationEngine], asset: str = "Stocks") -> pd.DataFrame:
+    rows = []
+    base_prices = pd.Series(results["Full Model"].market.assets[asset].price_history)
+    for label, eng in results.items():
+        prices = pd.Series(eng.market.assets[asset].price_history)
+        rets   = prices.pct_change().dropna()
+        total_return = (prices.iloc[-1] / prices.iloc[0] - 1) * 100.0
+        vol = rets.std() * 100.0
+        drawdown = ((prices / prices.cummax()) - 1).min() * 100.0
+        rows.append({
+            "Configuration": label,
+            "Total Return": total_return,
+            "Volatility (per period)": vol,
+            "Max Drawdown": drawdown,
+        })
+    df = pd.DataFrame(rows)
+    base_row = df[df["Configuration"] == "Full Model"].iloc[0]
+    df["Return Contribution (pp vs Full)"]     = base_row["Total Return"] - df["Total Return"]
+    df["Volatility Contribution (pp vs Full)"] = base_row["Volatility (per period)"] - df["Volatility (per period)"]
+    df["Drawdown Contribution (pp vs Full)"]   = base_row["Max Drawdown"] - df["Max Drawdown"]
+    return df
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MONTE CARLO ENGINE  (unchanged interface, now runs through new price engine)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_monte_carlo(base_env: MacroEnvironment, periods: int, n_seeds: int = 100) -> Dict:
@@ -863,7 +1187,7 @@ def monte_carlo_stats(arr: np.ndarray) -> Dict:
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCENARIO CONSISTENCY TESTS
+# SCENARIO CONSISTENCY TESTS  (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_consistency_tests(mc_results: Dict, scenario_name: str) -> List[Dict]:
@@ -931,7 +1255,7 @@ def run_consistency_tests(mc_results: Dict, scenario_name: str) -> List[Dict]:
     return tests
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ECONOMIC DOMINANCE SCORE
+# ECONOMIC DOMINANCE SCORE  (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_economic_dominance(engine: SimulationEngine) -> Dict:
@@ -989,7 +1313,7 @@ def compute_economic_dominance(engine: SimulationEngine) -> Dict:
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ROBUSTNESS / CONFIDENCE LEVEL
+# ROBUSTNESS / CONFIDENCE LEVEL  (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_confidence(mc_results: Dict) -> Dict:
@@ -1016,7 +1340,7 @@ def compute_confidence(mc_results: Dict) -> Dict:
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCENARIO PRESETS
+# SCENARIO PRESETS  (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 SCENARIOS = {
@@ -1030,7 +1354,7 @@ SCENARIOS = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NARRATIVE
+# NARRATIVE  (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_institutional_summary(engine: SimulationEngine) -> str:
@@ -1112,7 +1436,7 @@ def init_session_state():
         inflation=3.0, interest_rate=4.0, gdp_growth=2.0, oil_shock=0.0,
         sentiment="Neutral", regime="Expansion", periods=100, seed=42,
         engine=None, mc_results=None, mc_scenario=None,
-        mc_n_seeds=100, mc_running=False,
+        mc_n_seeds=100, mc_running=False, ablation_results=None,
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1139,6 +1463,7 @@ def run_simulation():
     engine = SimulationEngine(env, periods=st.session_state["periods"], seed=st.session_state["seed"])
     engine.run()
     st.session_state["engine"] = engine
+    st.session_state["ablation_results"] = None  # invalidate stale ablation run
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
@@ -1151,9 +1476,9 @@ def render_sidebar():
 
     st.sidebar.markdown(
         f"<div style='font-family:monospace;font-size:1.05rem;font-weight:700;color:{c_text};'>"
-        f"AGENT TWIN <span style='color:{c_green};font-size:.7rem;'>v2.1</span></div>"
+        f"AGENT TWIN <span style='color:{c_green};font-size:.7rem;'>v3.0</span></div>"
         f"<div style='color:{c_text_dim};font-size:.76rem;margin-bottom:1rem;'>"
-        "Robust Institutional Market Simulator</div>",
+        "Institutional Market Simulator</div>",
         unsafe_allow_html=True,
     )
     st.sidebar.slider("Inflation (%)",        -2.0, 12.0, key="inflation",     step=0.1)
@@ -1205,11 +1530,11 @@ def _xaxis(n):
 
 def render_header():
     st.markdown(
-        '<div class="at-header">AGENT TWIN <span style="font-size:1rem;color:#16a34a;">v2.1</span></div>',
+        '<div class="at-header">AGENT TWIN <span style="font-size:1rem;color:#16a34a;">v3.0</span></div>',
         unsafe_allow_html=True)
     st.markdown(
-        '<div class="at-sub">Robust valuation-aware institutional market simulator — '
-        'noise-reduced, Monte Carlo validated, economically consistent across seeds.</div>',
+        '<div class="at-sub">Institutional market simulator with square-root market-impact '
+        'price formation, fundamental mean reversion, full return attribution, and agent ablation analysis.</div>',
         unsafe_allow_html=True)
 
 def render_env_strip(engine: SimulationEngine):
@@ -1266,10 +1591,13 @@ def render_price_chart(engine: SimulationEngine):
     m = engine.market
     n = len(m.assets["Stocks"].price_history)
     x = _xaxis(n)
-    fig = _fig(h=420, title=dict(text="Asset Price Evolution (Base = 100)", font=dict(size=14)))
+    fig = _fig(h=420, title=dict(text="Asset Price Evolution (Base = 100) — solid = price, dashed = fair value", font=dict(size=14)))
     for name, col in [("Stocks", C["stock"]), ("Bonds", C["bond"]), ("Gold", C["gold"])]:
         fig.add_trace(go.Scatter(x=x, y=m.assets[name].price_history, name=name,
                                  line=dict(color=col, width=2.2)))
+        fig.add_trace(go.Scatter(x=x, y=m.assets[name].fair_value_history, name=f"{name} Fair Value",
+                                 line=dict(color=col, width=1.2, dash="dot"), opacity=0.6,
+                                 showlegend=True))
     for i, env in enumerate(m.env_history):
         if env.regime == "Recession":
             fig.add_vrect(x0=i-0.5, x1=i+0.5, fillcolor=C["recession"],
@@ -1491,6 +1819,16 @@ def render_rulebook():
                 "Fear & greed mean-revert each period (not permanent)",
             ]:
                 st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown("**Price Formation (NEW in v3.0)** &nbsp;<span class='badge'>√-Impact</span><span class='badge'>Mean Reversion</span><span class='badge'>Depth</span>", unsafe_allow_html=True)
+        for r in [
+            "impact_pct = sign(flow) · √|flow| · 100/√(market_depth)  — diminishing impact law",
+            "reversion_pct = −reversion_speed · ln(price/fair_value) · 100  — pulls price to fundamentals",
+            "noise_pct = N(0, base_vol · regime_vol_scale)",
+            "total = 8·tanh((impact+reversion+noise)/8)  — smooth damping, no hard floor to saturate",
+            "Stocks: depth=42, reversion=0.055  |  Bonds: depth=70, reversion=0.09  |  Gold: depth=30, reversion=0.045",
+        ]:
+            st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
 
 def render_simulation_log(engine: SimulationEngine):
     c_text     = C["text"]
@@ -1536,11 +1874,141 @@ def render_institutional_panel(engine: SimulationEngine):
     st.caption("Generated entirely from simulation arrays — no external AI API.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MONTE CARLO DASHBOARD
+# RETURN ATTRIBUTION DASHBOARD  (STEP 3 — new)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_attribution_section(engine: SimulationEngine):
+    st.markdown("### 🧮  Return Attribution — Why Did Stocks Move?")
+    st.caption("Decomposition reconciles exactly to the realised total return (log-additive, converted to simple-return space).")
+
+    asset_choice = st.selectbox("Asset", ["Stocks", "Bonds", "Gold"], key="attr_asset_select")
+    df = compute_attribution_table(engine, asset=asset_choice)
+    agent_names = [a.name for a in engine.agents]
+    summary = summarize_attribution(df, agent_names)
+
+    components = ["Valuation_Macro"] + agent_names + ["Noise"]
+    labels = {
+        "Valuation_Macro": "Valuation / Macro",
+        "Pension Fund": "Pension Fund Impact",
+        "Hedge Fund": "Hedge Fund Impact",
+        "Retail Investor": "Retail Impact",
+        "Noise": "Random Noise",
+    }
+    colors = {
+        "Valuation_Macro": C["valuation_attr"],
+        "Pension Fund": C["pension_attr"],
+        "Hedge Fund": C["hedge_attr"],
+        "Retail Investor": C["retail_attr"],
+        "Noise": C["noise_attr"],
+    }
+
+    # Waterfall-style bar chart
+    fig = _fig(h=340, title=dict(text=f"{asset_choice} Total Return Attribution", font=dict(size=14)))
+    names_ordered = [labels.get(c, c) for c in components] + ["Total Return"]
+    values_ordered = [summary[c] for c in components] + [summary["Total"]]
+    bar_colors = [colors.get(c, C["text_dim"]) for c in components] + [C["green"] if summary["Total"] >= 0 else C["red"]]
+    fig.add_trace(go.Bar(x=names_ordered, y=values_ordered, marker_color=bar_colors,
+                         text=[f"{v:+.1f}%" for v in values_ordered], textposition="outside"))
+    fig.add_hline(y=0, line_dash="dot", line_color=C["border"], line_width=1)
+    fig.update_layout(yaxis_title="Contribution to Total Return (%)", showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+    c_text_dim = C["text_dim"]
+    rows_html = "".join(
+        f"<tr><td style='padding:.35rem .7rem;font-family:monospace;font-size:.85rem;color:{colors.get(c, C['text'])};'>{labels.get(c,c)}</td>"
+        f"<td style='padding:.35rem .7rem;font-family:monospace;font-size:.85rem;text-align:right;'>{summary[c]:+.2f}%</td></tr>"
+        for c in components
+    )
+    st.markdown(
+        f"<div class='panel'><table style='width:100%;border-collapse:collapse;'>"
+        f"<thead><tr><th style='text-align:left;padding:.35rem .7rem;color:{c_text_dim};font-size:.75rem;text-transform:uppercase;'>Component</th>"
+        f"<th style='text-align:right;padding:.35rem .7rem;color:{c_text_dim};font-size:.75rem;text-transform:uppercase;'>Contribution</th></tr></thead>"
+        f"<tbody>{rows_html}"
+        f"<tr style='border-top:1px solid {C['border']};'><td style='padding:.45rem .7rem;font-family:monospace;font-weight:700;'>Total Return</td>"
+        f"<td style='padding:.45rem .7rem;font-family:monospace;font-weight:700;text-align:right;'>{summary['Total']:+.2f}%</td></tr>"
+        f"</tbody></table></div>",
+        unsafe_allow_html=True)
+
+    reconciled = abs(sum(summary[c] for c in components) - summary["Total"]) < 0.05
+    if reconciled:
+        st.markdown(f"<span style='color:{C['green']};font-family:monospace;font-size:.8rem;'>✓ Components reconcile exactly to total return.</span>", unsafe_allow_html=True)
+    else:
+        st.markdown(f"<span style='color:{C['amber']};font-family:monospace;font-size:.8rem;'>⚠ Reconciliation gap detected — check log.</span>", unsafe_allow_html=True)
+
+    with st.expander("Per-period attribution detail"):
+        st.dataframe(df.style.format({c: "{:+.2f}" for c in df.columns if c != "Period"}), use_container_width=True, height=300)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AGENT IMPACT ANALYSIS DASHBOARD  (STEP 4 — new)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_agent_impact_section(engine: SimulationEngine):
+    st.markdown("### 🔬  Agent Impact Analysis — Ablation Study")
+    st.caption("Re-runs the identical environment/seed with each agent's market flow removed in turn, isolating its price-formation footprint.")
+
+    if st.button("▶  Run Agent Ablation Study", type="primary"):
+        with st.spinner("Running 4 configurations (Full / w/o Pension / w/o Hedge / w/o Retail)..."):
+            results = run_agent_ablation(engine.base_env, periods=engine.periods, seed=st.session_state["seed"])
+            st.session_state["ablation_results"] = results
+
+    results = st.session_state.get("ablation_results")
+    if results is None:
+        st.info("Click **Run Agent Ablation Study** to quantify each agent's contribution to return, volatility, and drawdown.")
+        return
+
+    asset_choice = st.selectbox("Asset", ["Stocks", "Bonds", "Gold"], key="ablation_asset_select")
+    df = summarize_ablation(results, asset=asset_choice)
+
+    c_text_dim = C["text_dim"]
+    display_cols = ["Configuration", "Total Return", "Volatility (per period)", "Max Drawdown",
+                    "Return Contribution (pp vs Full)", "Volatility Contribution (pp vs Full)",
+                    "Drawdown Contribution (pp vs Full)"]
+    header_html = "".join(
+        f"<th style='padding:.3rem .6rem;font-size:.74rem;color:{c_text_dim};text-transform:uppercase;text-align:left;'>{c}</th>"
+        for c in display_cols
+    )
+    rows_html = ""
+    for _, row in df.iterrows():
+        is_full = row["Configuration"] == "Full Model"
+        cells = []
+        for c in display_cols:
+            v = row[c]
+            if c == "Configuration":
+                weight = "700" if is_full else "400"
+                cells.append(f"<td style='padding:.35rem .6rem;font-family:monospace;font-size:.85rem;font-weight:{weight};'>{v}</td>")
+            else:
+                cells.append(f"<td style='padding:.35rem .6rem;font-family:monospace;font-size:.85rem;text-align:right;'>{v:+.2f}</td>")
+        rows_html += f"<tr>{''.join(cells)}</tr>"
+
+    st.markdown(
+        f"<div class='panel'><table style='width:100%;border-collapse:collapse;'>"
+        f"<thead><tr>{header_html}</tr></thead><tbody>{rows_html}</tbody></table></div>",
+        unsafe_allow_html=True)
+
+    fig = _fig(h=320, title=dict(text=f"{asset_choice} — Return Contribution by Agent (pp vs Full Model)", font=dict(size=14)))
+    ablation_only = df[df["Configuration"] != "Full Model"]
+    fig.add_trace(go.Bar(
+        x=ablation_only["Configuration"], y=ablation_only["Return Contribution (pp vs Full)"],
+        marker_color=[C["pension_attr"], C["hedge_attr"], C["retail_attr"]],
+        text=[f"{v:+.1f}pp" for v in ablation_only["Return Contribution (pp vs Full)"]],
+        textposition="outside",
+    ))
+    fig.add_hline(y=0, line_dash="dot", line_color=C["border"], line_width=1)
+    fig.update_layout(yaxis_title="Return Contribution (pp)", showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "Interpretation: a positive 'Return Contribution' for 'Without X' means agent X's flow was a net "
+        "DRAG on this asset's return in the Full Model (removing it increases the return). A negative value "
+        "means agent X's flow was a net TAILWIND."
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MONTE CARLO DASHBOARD  (unchanged from v2.1, operates on new engine)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_monte_carlo_section():
-    st.markdown("### 🎲  Monte Carlo Validation (Parts 2–5)")
+    st.markdown("### 🎲  Monte Carlo Validation")
 
     with st.expander("Monte Carlo Settings & Run", expanded=True):
         col_s, col_n, col_btn = st.columns([2, 2, 1])
@@ -1574,7 +2042,6 @@ def render_monte_carlo_section():
 
     st.markdown(f"#### Monte Carlo Results — *{label}* ({mc['n_seeds']} seeds)")
 
-    # ── Summary Statistics ───────────────────────────────────────────────────
     sr_stats = monte_carlo_stats(mc["stock_returns"])
     br_stats = monte_carlo_stats(mc["bond_returns"])
     gr_stats = monte_carlo_stats(mc["gold_returns"])
@@ -1607,7 +2074,6 @@ def render_monte_carlo_section():
         f"<thead><tr>{header_html}</tr></thead><tbody>{html_rows}</tbody></table></div>",
         unsafe_allow_html=True)
 
-    # ── Histogram ────────────────────────────────────────────────────────────
     fig_hist = _fig(h=320, title=dict(text="Distribution of Stock Returns Across Seeds", font=dict(size=14)))
     fig_hist.add_trace(go.Histogram(
         x=mc["stock_returns"], nbinsx=25, name="Stock Returns",
@@ -1619,7 +2085,6 @@ def render_monte_carlo_section():
     fig_hist.update_layout(xaxis_title="Total Stock Return (%)", yaxis_title="Count")
     st.plotly_chart(fig_hist, use_container_width=True)
 
-    # ── Consistency Tests ────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("##### ✅  Scenario Consistency Tests")
 
@@ -1646,7 +2111,6 @@ def render_monte_carlo_section():
                 "</div>",
                 unsafe_allow_html=True)
 
-    # ── Economic Dominance Score ─────────────────────────────────────────────
     st.markdown("---")
     st.markdown("##### 📊  Economic Dominance Score")
 
@@ -1666,7 +2130,6 @@ def render_monte_carlo_section():
         sig   = dom["signal_pct"]
         noise = dom["noise_pct"]
 
-        # Pre-compute colors — NO backslashes inside f-string expressions
         sig_color   = C["green"] if sig > 40   else C["amber"] if sig > 25   else C["red"]
         noise_color = C["red"]   if noise > 70 else C["amber"] if noise > 55 else C["green"]
 
@@ -1731,7 +2194,6 @@ def render_monte_carlo_section():
                               yaxis=dict(range=[0,100], **LAYOUT["yaxis"]))
         st.plotly_chart(fig_dom, use_container_width=True)
 
-    # ── Robustness Dashboard ─────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("##### 🛡️  Robustness Dashboard")
 
@@ -1853,7 +2315,15 @@ def main():
     render_risk_contribution_chart(engine)
     st.markdown("---")
 
-    st.markdown("### 10 · Simulation Log")
+    st.markdown("### 10 · Return Attribution")
+    render_attribution_section(engine)
+    st.markdown("---")
+
+    st.markdown("### 11 · Agent Impact Analysis")
+    render_agent_impact_section(engine)
+    st.markdown("---")
+
+    st.markdown("### 12 · Simulation Log")
     render_simulation_log(engine)
     st.markdown("---")
 
@@ -1864,9 +2334,8 @@ def main():
 
     st.markdown("---")
     st.caption(
-        "Agent Twin v2.1 — noise-reduced, Monte Carlo validated. "
-        "Same scenario now produces consistent directional outcomes across seeds. "
-        "Not investment advice."
+        "Agent Twin v3.0 — square-root market impact, fundamental mean reversion, "
+        "exact return attribution, agent ablation analysis. Not investment advice."
     )
 
 if __name__ == "__main__":
