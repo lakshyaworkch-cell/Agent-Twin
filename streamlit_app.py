@@ -1729,11 +1729,15 @@ def render_monte_carlo_section():
 
         col1, col2, col3 = st.columns(3)
         col1.markdown(
-            f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-            f"<div class='metric-label'>Economic Signal Strength</div>"
-            color = C["green"] if sig > 40 else C["amber"] if sig > 25 else C["red"]
-            f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div></div>",
-            unsafe_allow_html=True)
+         color = C["green"] if sig > 40 else C["amber"] if sig > 25 else C["red"]
+
+    f"<div class='panel' style='text-align:center;padding:.7rem;'>"
+    f"<div class='metric-label'>Economic Signal Strength</div>"
+    f"<div class='metric-value' style='color:{color};'>{sig:.1f}%</div>"
+    f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div>"
+    f"</div>",
+    unsafe_allow_html=True
+)
         col2.markdown(
             f"<div class='panel' style='text-align:center;padding:.7rem;'>"
             f"<div class='metric-label'>Noise Contribution</div>"
