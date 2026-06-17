@@ -1714,11 +1714,7 @@ st.markdown("##### 📊  Economic Dominance Score")
 # Use the single-run engine if available; otherwise run seed 0
 engine = st.session_state.get("engine")
 if engine is None:
-    if scenario_name and scenario_name in SCENARIOS:
-        p = SCENARIOS[scenario_name]
-        env_ed = MacroEnvironment(**p)
-    else:
-        env_ed = _make_env()
+env_ed = _make_env()
     engine = SimulationEngine(env_ed, periods=st.session_state["periods"], seed=0)
     engine.run()
 
