@@ -338,7 +338,8 @@ class Agent:
     # bounds, small per-period rule triggers compound over 100 periods into
     # economically meaningless allocations (and prices that explode/collapse
     # to nonsense), since the same rule can keep firing every period a
-    # condition persists (e.g. "bullish sentiment" lasting 30 periods in a row).
+    # condition persists (e.g. "bullish sentiment" lasting 30 periods in a
+    # row).
     allocation_bounds: Dict[str, tuple] = {}
 
     def __init__(self, starting_allocation: Dict[str, float], starting_capital: float = 100.0):
@@ -1100,6 +1101,18 @@ def run_simulation():
     )
 
 
+def apply_scenario_and_run(name: str):
+    """Callback used by the scenario buttons. Runs in the on_click phase,
+    i.e. BEFORE the script body (and therefore the sidebar sliders/selectbox
+    bound to the same session_state keys) is re-instantiated on the rerun
+    triggered by the click. Mutating those keys here is safe; doing the same
+    mutation after the widgets have already been created in this run (as the
+    old inline `if button: ...` block did) is what raised the
+    StreamlitAPIException."""
+    apply_scenario(name)
+    run_simulation()
+
+
 # ==================================================================================
 # SIDEBAR — MARKET ENVIRONMENT CONTROLS
 # ==================================================================================
@@ -1139,10 +1152,13 @@ def render_sidebar():
     scenario_names = list(SCENARIOS.keys())
     for i, sname in enumerate(scenario_names):
         col = scenario_cols[i % 2]
-        if col.button(sname, key=f"scenario_{sname}", use_container_width=True):
-            apply_scenario(sname)
-            run_simulation()
-            st.rerun()
+        col.button(
+            sname,
+            key=f"scenario_{sname}",
+            use_container_width=True,
+            on_click=apply_scenario_and_run,
+            args=(sname,),
+        )
 
     st.sidebar.markdown("---")
     run_clicked = st.sidebar.button("▶  RUN SIMULATION", use_container_width=True, type="primary")
@@ -1290,6 +1306,13 @@ def render_demand_chart(engine: SimulationEngine):
                     totals[k] += v
         net_by_agent_asset.append((agent.name, totals, agent.color))
 
+    # NOTE: COLORS uses singular keys ("stock", "bond", "gold"), but the
+    # asset names used throughout the UI are plural ("Stocks", "Bonds",
+    # "Gold"). `COLORS[asset.lower()]` therefore raised a KeyError for
+    # "stocks" / "bonds" (only "gold" happens to match in both forms). Map
+    # explicitly instead of relying on a naming coincidence.
+    asset_color_map = {"Stocks": COLORS["stock"], "Bonds": COLORS["bond"], "Gold": COLORS["gold"]}
+
     fig = go.Figure()
     asset_list = ["Stocks", "Bonds", "Gold"]
     for asset in asset_list:
@@ -1297,7 +1320,7 @@ def render_demand_chart(engine: SimulationEngine):
             name=asset,
             x=[name for name, _, _ in net_by_agent_asset],
             y=[totals[asset] * 100 for _, totals, _ in net_by_agent_asset],
-            marker_color=COLORS[asset.lower()],
+            marker_color=asset_color_map[asset],
         ))
     fig.update_layout(
         **PLOTLY_TEMPLATE["layout"],
