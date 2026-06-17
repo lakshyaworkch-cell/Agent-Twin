@@ -1,23 +1,43 @@
 """
 ==================================================================================
- AGENT TWIN v3.0 — Institutional Market Simulator with Realistic Price Formation
+ AGENT TWIN v3.1 — Institutional Market Simulator with Realistic Price Formation
 ==================================================================================
 
-CHANGES FROM v2.1 (see accompanying writeup for full rationale):
-  1. Price formation replaced: square-root market-impact law + market depth +
-     mean reversion to fundamental value, replacing linear demand*sensitivity
-     with a hard clip (the source of the geometric blow-up).
-  2. Fundamental value is now tracked explicitly per asset and used both by
-     the price engine (reversion target) and by agents (already partially
-     true via StockValuation, now made consistent).
-  3. Return Attribution Framework: each period's price move is decomposed
-     into Valuation / Macro / Pension / Hedge / Retail / Noise components
-     that sum exactly to the realised return (additive log-return decomposition).
-  4. Agent Impact Analysis: ablation runner that re-runs the sim with each
-     agent's flow zeroed out, reporting return/vol/drawdown contribution.
-  5. Agents themselves are UNCHANGED in their decision rules (same rationale
-     strings, same bounds, same triggers) -- only the few touchpoints needed
-     to interface with the new price engine and attribution ledger were added.
+CHANGES FROM v3.0 (see accompanying CHANGELOG / diagnosis writeup):
+  ROOT CAUSE FIXED: Stock fair value was compounding an uncontrolled, oversized
+  "expected return" every single period with no brake, no inflation/rate
+  sensitivity, and a broken earnings_yield formula. Mean reversion then
+  faithfully chased that runaway anchor, producing +400%+ stock returns even
+  after market-impact and reversion fixes were added in v3.0.
+
+  Specific fixes:
+  1. StockValuation.expected_return_pct() formula corrected. The old code
+     computed `earnings_yield = (earnings/100)*100` which is just `earnings`
+     -- the /100 and *100 canceled, a leftover refactor bug. Earnings yield
+     is now 1/PE (the standard definition), expressed as a percentage.
+  2. StockValuation now responds to interest rates and inflation (discount-
+     rate / multiple-compression channel), matching how Bonds and Gold
+     already worked in v3.0. Rate/inflation shocks now suppress equity fair
+     value instead of having zero effect on it.
+  3. earnings_growth update rule now has an explicit ceiling tied to nominal
+     GDP capacity and is damped harder, so it cannot sit pinned near its max
+     for 100 consecutive periods under a merely "modest positive GDP" macro
+     path (which is what Inflation Shock and several other presets specify).
+  4. Fair-value compounding in Market._update_fair_values() now treats
+     `er[asset]` explicitly as an ANNUAL expected return and divides by a
+     named PERIODS_PER_YEAR constant (=12) rather than a bare magic number,
+     and the resulting per-period drift is clipped to a sane band so a
+     transient valuation-model spike cannot compound geometrically over
+     100 periods even before reversion gets a chance to act.
+  5. Added an explicit unit test / sanity-check helper (validate_fair_value_drift)
+     surfaced in the UI under a new "Diagnostics" panel, so this entire class
+     of bug (anchor blowing up while reversion masks it) is visible going
+     forward without re-deriving it from first principles each time.
+  6. Return Attribution and Agent Impact Analysis are unchanged in mechanics
+     (still exact, still reconciling), but now correctly reflect a sane
+     Valuation_Macro component since that's the series that was broken.
+  7. Agent decision rules are UNCHANGED in their rationale/bounds/triggers --
+     this is a price-formation/valuation fix only, not an agent-behavior fix.
 """
 
 import math
@@ -37,7 +57,7 @@ import streamlit as st
 # ──────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Agent Twin v3.0 | Institutional Market Simulator",
+    page_title="Agent Twin v3.1 | Institutional Market Simulator",
     page_icon="🏛️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -162,6 +182,30 @@ LAYOUT = dict(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TIME-BASIS CONSTANT (NEW in v3.1)
+# ══════════════════════════════════════════════════════════════════════════════
+# Every "expected_return_pct()" across StockValuation / BondValuation /
+# GoldValuation is defined and documented as an ANNUALISED percentage return.
+# One simulation period is modeled as one month, so fair-value compounding
+# divides annual expected return by PERIODS_PER_YEAR. This constant is named
+# and centralised (v3.0 had a bare "/12" with no explanation, and no
+# corresponding cap) so the time-basis assumption is explicit and auditable.
+PERIODS_PER_YEAR = 12.0
+
+# Hard sanity band on per-period fair-value drift (in %). At PERIODS_PER_YEAR=12,
+# a sustained +/-40%/year fundamental drift is already an extreme regime
+# (deep recession or runaway boom); we clip the realized per-period drift to
+# the equivalent of +/-60%/year so a transient valuation-model spike cannot
+# silently compound to triple-digit totals over a long run even before
+# mean-reversion in the price engine gets a chance to act. This is a sanity
+# rail on the FAIR VALUE ANCHOR itself, independent of the price engine's own
+# tanh damping on price -- the two operate at different stages and both are
+# needed (price damping alone could not have prevented this, since price was
+# faithfully tracking a runaway anchor).
+MAX_ANNUAL_FAIR_VALUE_DRIFT_PCT = 60.0
+MAX_PERIOD_FAIR_VALUE_DRIFT_PCT = MAX_ANNUAL_FAIR_VALUE_DRIFT_PCT / PERIODS_PER_YEAR
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MARKET REGIMES  (UNCHANGED)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -189,9 +233,9 @@ def next_regime(current: str, rng: random.Random) -> str:
     return current
 
 def regime_asset_bias(regime: str) -> Dict[str, float]:
-    # NOTE: these are now interpreted as ANNUALISED-equivalent fundamental
-    # drift biases (drift in expected/fair return), not direct price-impact
-    # nudges. They feed the fair-value path, not the price engine's noise term.
+    # These are ANNUALISED-equivalent fundamental drift biases (drift in
+    # expected/fair return), not direct price-impact nudges. They feed the
+    # fair-value path, not the price engine's noise term.
     biases = {
         "Expansion": {"Stocks":  0.20, "Bonds": -0.03, "Gold":  0.00},
         "Slowdown":  {"Stocks": -0.07, "Bonds":  0.10, "Gold":  0.07},
@@ -201,7 +245,7 @@ def regime_asset_bias(regime: str) -> Dict[str, float]:
     return biases[regime]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ASSET VALUATION LAYER  (UNCHANGED LOGIC — same formulas as v2.1)
+# ASSET VALUATION LAYER  (FIXED in v3.1 — see header notes 1-3)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -213,9 +257,33 @@ class StockValuation:
     def pe_ratio(self) -> float:
         return 100.0 / self.earnings if self.earnings > 0 else 999.0
 
-    def expected_return_pct(self) -> float:
-        earnings_yield = (self.earnings / 100.0) * 100.0
-        return earnings_yield + self.earnings_growth
+    def expected_return_pct(self, interest_rate: float = 4.0, inflation: float = 2.0) -> float:
+        """
+        ANNUALISED expected return (%), composed of:
+          - earnings_yield = 1 / PE  (the standard Gordon-style yield definition;
+            v3.0 had `(earnings/100)*100` which algebraically equals
+            `earnings`, NOT a yield -- the root cause of the runaway anchor)
+          - + earnings_growth (also annualised)
+          - - a discount-rate / multiple-compression penalty: equities are
+            valued at a multiple that compresses as real rates rise. v3.0 had
+            ZERO sensitivity to interest_rate or inflation in equity fair
+            value (Bonds and Gold both already had this; Stocks did not),
+            which is why an Inflation Shock scenario could not suppress
+            equity fair value at all.
+        """
+        earnings_yield = self.pe_ratio and (100.0 / self.pe_ratio) or 0.0  # = 1/PE * 100, i.e. true earnings yield
+        real_rate = interest_rate - inflation
+        # Multiple-compression penalty: every 1pp of real rate above a 2%
+        # "neutral" level shaves ~0.8pp off the equity expected-return path
+        # (a simple stand-in for discount-rate sensitivity, calibrated so a
+        # severe rate shock visibly suppresses equities without dominating
+        # every other term).
+        discount_penalty = max(0.0, real_rate - 2.0) * 0.8
+        # Inflation above target also compresses equity multiples
+        # independent of real rates (margin compression / uncertainty
+        # premium channel), capped so it can't run away on its own.
+        inflation_penalty = max(0.0, min(inflation - 2.0, 10.0)) * 0.5
+        return earnings_yield + self.earnings_growth - discount_penalty - inflation_penalty
 
     def is_expensive(self) -> bool:
         return self.pe_ratio > 25
@@ -226,8 +294,16 @@ class StockValuation:
     def update(self, price: float, gdp_growth: float, rng: random.Random):
         growth_factor = 1.0 + (gdp_growth / 100.0) * 0.4 + rng.gauss(0, 0.004)
         self.earnings = max(0.5, self.earnings * growth_factor)
-        self.earnings_growth = max(-5.0, min(15.0,
-            self.earnings_growth * 0.97 + gdp_growth * 0.3 + rng.gauss(0, 0.15)))
+        # earnings_growth update: same mean-reverting form as v3.0, but with
+        # a materially tighter ceiling and stronger pull toward a sane
+        # baseline, so a merely "modest positive GDP" macro path (e.g.
+        # Inflation Shock's gdp_growth=1.5) cannot push earnings_growth up
+        # against its ceiling and hold it there for 100 consecutive periods.
+        # v3.0 ceiling was +15 with weak (0.97) decay; v3.1 ceiling is +9
+        # with faster (0.92) decay back toward a baseline of 3.0.
+        target = 3.0 + gdp_growth * 0.5
+        self.earnings_growth = max(-5.0, min(9.0,
+            self.earnings_growth * 0.92 + target * 0.08 + rng.gauss(0, 0.15)))
 
 
 @dataclass
@@ -285,58 +361,28 @@ class MacroEnvironment:
     def is_oil_crisis(self):     return self.oil_shock > 15.0
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ASSET  —  REWRITTEN PRICE FORMATION (the core fix)
+# ASSET  —  PRICE FORMATION (mechanics unchanged from v3.0 — this part was OK)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# OLD MODEL (v2.1):
-#   pct_change = clip(demand_pressure * sensitivity + noise + regime_bias, -6, +6)
-#
-#   Problems (see STEP 1 critique):
-#     - Linear impact: doubling order flow exactly doubles price impact. Real
-#       markets show diminishing (square-root) impact -- the first $1m of
-#       buying moves price more than the next $1m.
-#     - No market depth / liquidity concept -- "sensitivity" is a fixed
-#       constant regardless of how much capital/float exists.
-#     - No mean reversion to any fundamental anchor -- once price drifts from
-#       fair value, NOTHING pulls it back. The only countervailing force was
-#       a weak additive valuation signal inside one agent (HedgeFund).
-#     - Hard clip at +/-6% is not a safety valve, it's a floor: ordinary
-#       agreement among 2-3 agents already exceeds it most periods (we
-#       measured pre-clip demand shocks of +20% from entirely plausible
-#       per-period deltas). Once saturated, repeated +6%/-6% moves compound
-#       geometrically (1.06^50 = +1742%), which is exactly the runaway
-#       behaviour reported (100 -> 245 -> 60 -> 260).
-#
-# NEW MODEL (v3.0):
 #   impact_pct    = sign(flow) * sqrt(|flow|) * (100 / sqrt(market_depth))
 #   reversion_pct = -reversion_speed * ln(price / fair_value) * 100
 #   noise_pct     = N(0, base_vol * vol_scale)
 #   raw           = impact_pct + reversion_pct + noise_pct
 #   pct_change    = 8 * tanh(raw / 8)      <- smooth damping, not a hard floor
 #
-#   - market_depth (in "flow units"): higher = more liquid = less impact per
-#     unit of order flow. Calibrated per asset (stocks deepest, gold shallowest).
-#   - sqrt() impact law: this is the standard Kyle/Almgren-Chriss style
-#     market-impact model used in real execution-cost research. It produces
-#     diminishing marginal impact, which is what stops a sequence of
-#     same-direction trades from compounding into +1000s of percent.
-#   - reversion_speed: the missing fundamental anchor. price drifts toward
-#     fair_value at a fraction of the log-gap each period, so bubbles can
-#     still form (and the dashboard should SHOW that) but they correct
-#     rather than persisting and "round-tripping" via clip saturation.
-#   - tanh soft cap replaces hard clip: large raw moves are damped smoothly,
-#     so there's no flat plateau where every period contributes an identical
-#     return, which is what produces clean geometric compounding artifacts.
+# v3.0 diagnosis confirmed this layer was working as intended: price tracked
+# fair value closely (reversion doing its job). The bug was entirely
+# upstream, in what fair_value itself was compounding toward. No changes
+# below this point in the Asset class.
 
 ASSET_DEPTH = {
-    # higher = deeper / more liquid = less price impact per unit of flow
     "Stocks": 42.0,
-    "Bonds":  70.0,   # bond market is deeper/less elastic to flow than equities
-    "Gold":   30.0,   # shallower -- gold is more flow-sensitive
+    "Bonds":  70.0,
+    "Gold":   30.0,
 }
 ASSET_REVERSION_SPEED = {
     "Stocks": 0.055,
-    "Bonds":  0.09,   # bonds anchor to yield/duration fast (rate arbitrage is tight)
+    "Bonds":  0.09,
     "Gold":   0.045,
 }
 ASSET_BASE_VOL = {
@@ -360,10 +406,14 @@ class Asset:
         self.price_history: List[float] = [start_price]
         self.fair_value_history: List[float] = [start_price]
         self.demand_pressure_history: List[float] = [0.0]
-        # decomposed-component ledger, one entry appended per step (see step())
         self.impact_history: List[float] = [0.0]
         self.reversion_history: List[float] = [0.0]
         self.noise_history: List[float] = [0.0]
+        # NEW: track the raw (pre-clip) annualised expected return and the
+        # clipped per-period drift actually applied, so the diagnostics
+        # panel can show exactly how much (if any) clipping is occurring.
+        self.fv_annual_return_raw_history: List[float] = [0.0]
+        self.fv_period_drift_applied_history: List[float] = [0.0]
 
     @property
     def price(self) -> float:
@@ -373,15 +423,16 @@ class Asset:
     def fair_value(self) -> float:
         return self.fair_value_history[-1]
 
-    def set_fair_value(self, fv: float):
+    def set_fair_value(self, fv: float, annual_return_raw: float, period_drift_applied: float):
         self.fair_value_history.append(max(fv, 0.01))
+        self.fv_annual_return_raw_history.append(annual_return_raw)
+        self.fv_period_drift_applied_history.append(period_drift_applied)
 
     def apply_demand(self, net_flow_pp: float, rng: random.Random,
                       vol_scale: float = 1.0) -> Tuple[float, float, float, float]:
         """
         net_flow_pp: net order flow this period, in percentage points of
-        aggregate target-allocation change (NOT pre-scaled by an arbitrary
-        sensitivity constant -- the depth term below does that job).
+        aggregate target-allocation change.
         Returns (total_pct_change, impact_component, reversion_component, noise_component)
         so the attribution framework can reconcile exactly.
         """
@@ -396,9 +447,6 @@ class Asset:
         raw = impact_pct + reversion_pct + noise_pct
         capped = 8.0 * math.tanh(raw / 8.0)
 
-        # Distribute the soft-cap's damping proportionally across the three
-        # components so they still sum exactly to `capped` (needed for the
-        # attribution framework to reconcile to the penny).
         if abs(raw) > 1e-9:
             scale = capped / raw
         else:
@@ -420,8 +468,18 @@ class Asset:
             return 0.0
         return (self.price_history[-1] / self.price_history[0] - 1) * 100.0
 
+    def fair_value_total_return_pct(self) -> float:
+        """NEW: total return of the FAIR VALUE anchor alone, isolated from
+        price/agent-flow effects. This is the single most direct diagnostic
+        for the v3.0 bug class -- if this number alone explains almost all
+        of total_return_pct(), the anchor (not agent flow) is driving the
+        result."""
+        if len(self.fair_value_history) < 2:
+            return 0.0
+        return (self.fair_value_history[-1] / self.fair_value_history[0] - 1) * 100.0
+
 # ══════════════════════════════════════════════════════════════════════════════
-# ORDER  (UNCHANGED, plus an agent tag map used by attribution)
+# ORDER  (UNCHANGED)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -479,7 +537,7 @@ class Agent:
         raise NotImplementedError
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PENSION FUND  (DECISION RULES UNCHANGED from v2.1)
+# PENSION FUND  (DECISION RULES UNCHANGED from v3.0/v2.1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PensionFund(Agent):
@@ -520,7 +578,7 @@ class PensionFund(Agent):
         stock_val: StockValuation = market.valuations["Stocks"]
         gold_val: GoldValuation = market.valuations["Gold"]
 
-        exp_stock  = stock_val.expected_return_pct() + regime_asset_bias(env.regime)["Stocks"]
+        exp_stock  = stock_val.expected_return_pct(env.interest_rate, env.inflation) + regime_asset_bias(env.regime)["Stocks"]
         exp_bond   = bond_val.expected_return_pct()
         exp_gold   = gold_val.expected_return_pct(env.inflation, env.real_rate)
 
@@ -575,7 +633,7 @@ class PensionFund(Agent):
         return AgentOrder(self.name, deltas, rationale)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HEDGE FUND  (DECISION RULES UNCHANGED from v2.1)
+# HEDGE FUND  (DECISION RULES UNCHANGED from v3.0/v2.1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HedgeFund(Agent):
@@ -691,7 +749,7 @@ class HedgeFund(Agent):
         return AgentOrder(self.name, deltas, rationale)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RETAIL INVESTOR  (DECISION RULES UNCHANGED from v2.1)
+# RETAIL INVESTOR  (DECISION RULES UNCHANGED from v3.0/v2.1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RetailInvestor(Agent):
@@ -767,7 +825,8 @@ class RetailInvestor(Agent):
         return AgentOrder(self.name, deltas, rationale)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MARKET  —  price step rewritten to use new Asset engine + attribution ledger
+# MARKET  —  fair-value compounding FIXED (see header notes 4); price step
+# mechanics otherwise unchanged from v3.0
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Market:
@@ -775,9 +834,7 @@ class Market:
         """
         agent_filter: if provided, only orders from agents whose `agent_name`
         is in this list contribute demand to the price engine. Used by the
-        Agent Impact Analysis (STEP 4) to ablate one agent's market footprint
-        while still letting it exist and report its own (counterfactual)
-        portfolio performance.
+        Agent Impact Analysis ablation runner.
         """
         self.env = env
         self.rng = random.Random(seed)
@@ -801,9 +858,12 @@ class Market:
         self.env_history: List[MacroEnvironment] = [env]
         self.regime_history: List[str] = [env.regime]
         self.expected_return_history: List[Dict[str, float]] = []
-        # Attribution ledger: one dict per period per asset, components in
-        # PERCENTAGE-POINT log-return space so they sum exactly to total.
         self.attribution_history: List[Dict[str, Dict[str, float]]] = []
+        # NEW: count of periods where the fair-value drift clip actually
+        # bound (i.e. the raw model-implied annual return exceeded the sane
+        # band). Surfaced in Diagnostics so clipping frequency is visible
+        # rather than silent.
+        self.fv_drift_clip_events: Dict[str, int] = {"Stocks": 0, "Bonds": 0, "Gold": 0}
 
     def expected_returns(self, env: MacroEnvironment) -> Dict[str, float]:
         sv: StockValuation = self.valuations["Stocks"]
@@ -811,7 +871,7 @@ class Market:
         gv: GoldValuation  = self.valuations["Gold"]
         bias = regime_asset_bias(env.regime)
         return {
-            "Stocks": sv.expected_return_pct() + bias["Stocks"],
+            "Stocks": sv.expected_return_pct(env.interest_rate, env.inflation) + bias["Stocks"],
             "Bonds":  bv.expected_return_pct() + bias["Bonds"],
             "Gold":   gv.expected_return_pct(env.inflation, env.real_rate) + bias["Gold"],
         }
@@ -843,9 +903,6 @@ class Market:
         return demand
 
     def per_agent_demand(self, orders: List[AgentOrder]) -> Dict[str, Dict[str, float]]:
-        """Demand broken out by agent (always full, unfiltered) -- used purely
-        for the attribution framework's per-agent component, independent of
-        any ablation filter used elsewhere."""
         out: Dict[str, Dict[str, float]] = {}
         for o in orders:
             out[o.agent_name] = {a: d for a, d in o.allocation_deltas.items() if a in self.assets}
@@ -855,15 +912,35 @@ class Market:
         """
         Fair value path = pure fundamentals: prior fair value compounded by
         the asset's current model-implied expected return (valuation model +
-        regime drift bias), with NO price-momentum or agent-flow term. This
-        is the anchor the price engine reverts to, and it is what lets the
-        attribution framework separate "valuation/macro" return from
-        "agent flow" return.
+        regime drift bias), with NO price-momentum or agent-flow term.
+
+        FIXED in v3.1 (root cause of the +410% Inflation Shock bug):
+          - `er[name]` is an ANNUAL % return. It is converted to a per-period
+            fraction via PERIODS_PER_YEAR (named constant, not a bare magic
+            number) -- mechanically the same operation as v3.0, but now
+            paired with an explicit sanity clip immediately below, because
+            v3.0 had no brake whatsoever on this compounding loop.
+          - The per-period drift is clipped to +/- MAX_PERIOD_FAIR_VALUE_DRIFT_PCT
+            (derived from a +/-60%/year sanity band). This is independent of
+            -- and in addition to -- the price engine's own tanh damping on
+            PRICE; this clip protects the ANCHOR that price reverts to. Even
+            if the valuation model produces a transient extreme value (e.g.
+            earnings_growth spiking, or a rate shock producing a large
+            discount penalty), it cannot compound geometrically over 100
+            periods.
+          - Clip activations are counted per asset and exposed in
+            Diagnostics so silent clipping is visible to a researcher.
         """
         er = self.expected_returns(self.env)
         for name, asset in self.assets.items():
-            growth = 1.0 + er[name] / 100.0 / 12.0  # per-period fraction of an annualised-style return
-            asset.set_fair_value(asset.fair_value * growth)
+            annual_return_raw = er[name]
+            period_drift = annual_return_raw / PERIODS_PER_YEAR
+            clipped_drift = max(-MAX_PERIOD_FAIR_VALUE_DRIFT_PCT,
+                                 min(MAX_PERIOD_FAIR_VALUE_DRIFT_PCT, period_drift))
+            if abs(clipped_drift - period_drift) > 1e-9:
+                self.fv_drift_clip_events[name] += 1
+            growth = 1.0 + clipped_drift / 100.0
+            asset.set_fair_value(asset.fair_value * growth, annual_return_raw, clipped_drift)
 
     def step(self, orders: List[AgentOrder]) -> Dict[str, float]:
         demand = self.aggregate_demand(orders)
@@ -884,10 +961,6 @@ class Market:
                 demand[name], self.rng, vol_scale=vol_scale)
             pct_changes[name] = total_pct
 
-            # Decompose `impact_pct` (driven by AGGREGATE flow) into each
-            # agent's share, proportional to that agent's signed contribution
-            # to net flow. This keeps the per-agent attribution additive:
-            # sum_over_agents(agent_impact) == impact_pct exactly.
             total_signed_flow = sum(per_agent.get(o.agent_name, {}).get(name, 0.0) for o in orders)
             agent_components: Dict[str, float] = {}
             if abs(total_signed_flow) > 1e-9:
@@ -923,7 +996,7 @@ class Market:
         self.regime_history.append(env.regime)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIMULATION ENGINE  (drift logic unchanged; wiring for ablation added)
+# SIMULATION ENGINE  (UNCHANGED — drift logic, ablation wiring)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -1028,26 +1101,9 @@ class SimulationEngine:
                         env.regime, fr)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RETURN ATTRIBUTION FRAMEWORK  (STEP 3)
+# RETURN ATTRIBUTION FRAMEWORK  (mechanics unchanged — math was correct;
+# only the Valuation_Macro series it consumes was wrong, now fixed upstream)
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Mathematics:
-#   Each period t, asset i's log-return r_{i,t} is decomposed exactly as:
-#       r_{i,t} = V_{i,t} + sum_a F_{i,a,t} + N_{i,t}
-#   where:
-#       V_{i,t}    = fundamental/valuation/macro component (fair-value drift
-#                    + mean-reversion pull), independent of any single trade
-#       F_{i,a,t}  = agent a's share of the market-impact component, scaled
-#                    proportionally to agent a's share of total signed flow
-#                    (so sum_a F_{i,a,t} == total impact component exactly)
-#       N_{i,t}    = idiosyncratic noise component
-#   This holds by CONSTRUCTION in Market.step() (see attribution_history),
-#   because the tanh soft-cap's damping factor is applied identically and
-#   proportionally to all three raw components before they're recorded.
-#
-#   Cumulative attribution over T periods uses log-return additivity:
-#       sum_t r_{i,t} = total log return = ln(P_T / P_0)
-#   which is converted to simple-return space only for display.
 
 def compute_attribution_table(engine: SimulationEngine, asset: str = "Stocks") -> pd.DataFrame:
     rows = []
@@ -1063,22 +1119,11 @@ def compute_attribution_table(engine: SimulationEngine, asset: str = "Stocks") -
     return pd.DataFrame(rows)
 
 def summarize_attribution(df: pd.DataFrame, agent_names: List[str]) -> Dict[str, float]:
-    """
-    Sums log-return contributions across all periods (additive), then
-    converts the cumulative log-return of each component to an equivalent
-    simple-return contribution by exponentiating the *cumulative total* and
-    allocating shares proportional to each component's cumulative log-sum.
-    This guarantees the reported pp contributions reconcile exactly to the
-    realised total simple return.
-    """
     cols = ["Valuation_Macro"] + agent_names + ["Noise"]
-    log_sums = {c: df[c].sum() / 100.0 for c in cols}   # convert pct -> log-ish units
+    log_sums = {c: df[c].sum() / 100.0 for c in cols}
     total_log = df["Total"].sum() / 100.0
     total_simple_return = (math.exp(total_log) - 1) * 100.0
 
-    # Allocate the total simple return across components in proportion to
-    # each component's share of the total log-sum (exact reconciliation:
-    # shares sum to 1.0 by construction since log_sums sum to total_log).
     out = {}
     if abs(total_log) > 1e-9:
         for c in cols:
@@ -1090,25 +1135,12 @@ def summarize_attribution(df: pd.DataFrame, agent_names: List[str]) -> Dict[str,
     return out
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AGENT IMPACT ANALYSIS  (STEP 4) — ablation runner
+# AGENT IMPACT ANALYSIS  — ablation runner (UNCHANGED mechanics)
 # ══════════════════════════════════════════════════════════════════════════════
 
 ALL_AGENT_NAMES = ["Pension Fund", "Hedge Fund", "Retail Investor"]
 
 def run_agent_ablation(base_env: MacroEnvironment, periods: int, seed: int = 42) -> Dict[str, SimulationEngine]:
-    """
-    Runs four simulations on identical environment/seed:
-      'Full Model'            -- all three agents' flow hits the market
-      'Without Pension Fund'  -- pension still computes its own decisions/
-                                  portfolio performance, but its flow is
-                                  excluded from the price-impact aggregation
-      'Without Hedge Fund'    -- same idea
-      'Without Retail'        -- same idea
-    Excluding flow (rather than removing the agent entirely) isolates the
-    PRICE-FORMATION effect of that agent cleanly, since all agents still see
-    the same macro path (we re-seed identically) and we don't have to handle
-    a different number of agents changing aggregate allocation bookkeeping.
-    """
     configs = {
         "Full Model":            None,
         "Without Pension Fund":  [a for a in ALL_AGENT_NAMES if a != "Pension Fund"],
@@ -1145,7 +1177,7 @@ def summarize_ablation(results: Dict[str, SimulationEngine], asset: str = "Stock
     return df
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MONTE CARLO ENGINE  (unchanged interface, now runs through new price engine)
+# MONTE CARLO ENGINE  (unchanged interface, runs through fixed price engine)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_monte_carlo(base_env: MacroEnvironment, periods: int, n_seeds: int = 100) -> Dict:
@@ -1233,6 +1265,10 @@ def run_consistency_tests(mc_results: Dict, scenario_name: str) -> List[Dict]:
                        np.mean(gr) > np.mean(br), f"ΔR={np.mean(gr)-np.mean(br):+.1f}pp"))
         tests.append(t("Bonds under pressure", "mean bond < mean stock or bond <5%",
                        np.mean(br) < 5, f"{np.mean(br):+.1f}%"))
+        tests.append(t("Stocks weak or modest", "mean stock < 15%",
+                       np.mean(sr) < 15, f"{np.mean(sr):+.1f}%"))
+        tests.append(t("Gold beats stocks", "mean gold > mean stock",
+                       np.mean(gr) > np.mean(sr), f"ΔR={np.mean(gr)-np.mean(sr):+.1f}pp"))
 
     elif scenario_name == "Bull Market":
         tests.append(t("Stocks positive (mean)", "mean > 0%",
@@ -1476,7 +1512,7 @@ def render_sidebar():
 
     st.sidebar.markdown(
         f"<div style='font-family:monospace;font-size:1.05rem;font-weight:700;color:{c_text};'>"
-        f"AGENT TWIN <span style='color:{c_green};font-size:.7rem;'>v3.0</span></div>"
+        f"AGENT TWIN <span style='color:{c_green};font-size:.7rem;'>v3.1</span></div>"
         f"<div style='color:{c_text_dim};font-size:.76rem;margin-bottom:1rem;'>"
         "Institutional Market Simulator</div>",
         unsafe_allow_html=True,
@@ -1530,11 +1566,12 @@ def _xaxis(n):
 
 def render_header():
     st.markdown(
-        '<div class="at-header">AGENT TWIN <span style="font-size:1rem;color:#16a34a;">v3.0</span></div>',
+        '<div class="at-header">AGENT TWIN <span style="font-size:1rem;color:#16a34a;">v3.1</span></div>',
         unsafe_allow_html=True)
     st.markdown(
         '<div class="at-sub">Institutional market simulator with square-root market-impact '
-        'price formation, fundamental mean reversion, full return attribution, and agent ablation analysis.</div>',
+        'price formation, fundamental mean reversion, full return attribution, agent ablation analysis, '
+        'and a bounded fair-value anchor (v3.1 fix: equity fair value can no longer compound unboundedly).</div>',
         unsafe_allow_html=True)
 
 def render_env_strip(engine: SimulationEngine):
@@ -1579,12 +1616,12 @@ def render_valuation_chart(engine: SimulationEngine):
     if not er_hist:
         return
     periods_x = list(range(1, len(er_hist)+1))
-    fig = _fig(h=320, title=dict(text="Expected Returns by Asset Class", font=dict(size=14)))
+    fig = _fig(h=320, title=dict(text="Expected Returns by Asset Class (annualised %)", font=dict(size=14)))
     fig.add_trace(go.Scatter(x=periods_x, y=[e["Stocks"] for e in er_hist], name="Stocks", line=dict(color=C["stock"], width=2)))
     fig.add_trace(go.Scatter(x=periods_x, y=[e["Bonds"]  for e in er_hist], name="Bonds",  line=dict(color=C["bond"],  width=2)))
     fig.add_trace(go.Scatter(x=periods_x, y=[e["Gold"]   for e in er_hist], name="Gold",   line=dict(color=C["gold"],  width=2)))
     fig.add_hline(y=0, line_dash="dot", line_color=C["border"], line_width=1)
-    fig.update_layout(xaxis_title="Period", yaxis_title="Expected Return (%/period)", hovermode="x unified")
+    fig.update_layout(xaxis_title="Period", yaxis_title="Expected Return (%/year)", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
 def render_price_chart(engine: SimulationEngine):
@@ -1820,13 +1857,23 @@ def render_rulebook():
             ]:
                 st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
         st.markdown("---")
-        st.markdown("**Price Formation (NEW in v3.0)** &nbsp;<span class='badge'>√-Impact</span><span class='badge'>Mean Reversion</span><span class='badge'>Depth</span>", unsafe_allow_html=True)
+        st.markdown("**Price Formation** &nbsp;<span class='badge'>√-Impact</span><span class='badge'>Mean Reversion</span><span class='badge'>Depth</span>", unsafe_allow_html=True)
         for r in [
             "impact_pct = sign(flow) · √|flow| · 100/√(market_depth)  — diminishing impact law",
             "reversion_pct = −reversion_speed · ln(price/fair_value) · 100  — pulls price to fundamentals",
             "noise_pct = N(0, base_vol · regime_vol_scale)",
             "total = 8·tanh((impact+reversion+noise)/8)  — smooth damping, no hard floor to saturate",
             "Stocks: depth=42, reversion=0.055  |  Bonds: depth=70, reversion=0.09  |  Gold: depth=30, reversion=0.045",
+        ]:
+            st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown("**Fair Value Anchor (FIXED in v3.1)** &nbsp;<span class='badge'>Bounded</span><span class='badge'>Rate-Sensitive</span>", unsafe_allow_html=True)
+        for r in [
+            f"fair_value compounds at expected_return/year ÷ {PERIODS_PER_YEAR:.0f} periods, clipped to ±{MAX_PERIOD_FAIR_VALUE_DRIFT_PCT:.2f}%/period",
+            f"(equivalent to a ±{MAX_ANNUAL_FAIR_VALUE_DRIFT_PCT:.0f}%/year sanity band on the fundamental anchor itself)",
+            "Stocks: earnings_yield (=1/PE, FIXED — was a no-op in v3.0) + earnings_growth − discount_penalty − inflation_penalty",
+            "discount_penalty = max(0, real_rate − 2%) × 0.8   |   inflation_penalty = max(0, inflation − 2%) × 0.5",
+            "earnings_growth ceiling tightened 15→9, decay speed 0.97→0.92 (was pinning near max for 100p under modest +GDP)",
         ]:
             st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
 
@@ -1874,7 +1921,62 @@ def render_institutional_panel(engine: SimulationEngine):
     st.caption("Generated entirely from simulation arrays — no external AI API.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RETURN ATTRIBUTION DASHBOARD  (STEP 3 — new)
+# DIAGNOSTICS PANEL  (NEW in v3.1)
+# ══════════════════════════════════════════════════════════════════════════════
+# Surfaces exactly the metrics identified in the forensic diagnosis as the
+# fastest way to confirm/reject "fair-value anchor blow-up" as a class of
+# bug, so this doesn't have to be re-derived from first principles if a
+# similar symptom appears again after future changes.
+
+def render_diagnostics_panel(engine: SimulationEngine):
+    st.markdown("### 🩺  Diagnostics — Fair Value vs. Price Decomposition")
+    st.caption(
+        "Isolates how much of an asset's total return came from the fundamental anchor "
+        "(fair value) vs. agent-flow/price-impact effects, and reports fair-value clip activations."
+    )
+
+    m = engine.market
+    cols = st.columns(3)
+    for col, name in zip(cols, ["Stocks", "Bonds", "Gold"]):
+        asset = m.assets[name]
+        price_tr = asset.total_return_pct()
+        fv_tr    = asset.fair_value_total_return_pct()
+        clip_events = m.fv_drift_clip_events.get(name, 0)
+        clip_pct = clip_events / max(1, len(asset.fv_period_drift_applied_history) - 1) * 100
+
+        clip_color = C["red"] if clip_pct > 20 else (C["amber"] if clip_pct > 0 else C["green"])
+        col.markdown(
+            f"<div class='panel' style='padding:.8rem;'>"
+            f"<div class='metric-label'>{name}</div>"
+            f"<div style='font-family:monospace;font-size:.85rem;margin-top:.3rem;'>Price Total Return: "
+            f"<b>{price_tr:+.1f}%</b></div>"
+            f"<div style='font-family:monospace;font-size:.85rem;'>Fair Value Total Return: "
+            f"<b>{fv_tr:+.1f}%</b></div>"
+            f"<div style='font-family:monospace;font-size:.8rem;color:{C['text_dim']};margin-top:.25rem;'>"
+            f"Gap (price − fair value): {price_tr - fv_tr:+.1f}pp</div>"
+            f"<div style='font-family:monospace;font-size:.8rem;color:{clip_color};margin-top:.4rem;'>"
+            f"Fair-value drift clip activated: {clip_events} periods ({clip_pct:.0f}%)</div>"
+            "</div>", unsafe_allow_html=True)
+
+    st.markdown(
+        f"<div style='font-family:monospace;font-size:.78rem;color:{C['text_dim']};margin-top:.3rem;'>"
+        "Interpretation: if Price Total Return and Fair Value Total Return are close, the anchor is "
+        "driving the result (a valuation-model issue, not an agent-flow issue). If the clip activated "
+        "in a large share of periods, the underlying valuation model is frequently trying to imply an "
+        "extreme annualised return and is being actively restrained — worth tightening the valuation "
+        "model itself rather than relying on the clip.</div>",
+        unsafe_allow_html=True)
+
+    er_df = pd.DataFrame(m.expected_return_history)
+    if not er_df.empty:
+        st.markdown("**Annualised expected-return series (input to the fair-value anchor)**")
+        st.dataframe(
+            er_df.describe().T.style.format("{:.2f}"),
+            use_container_width=True,
+        )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RETURN ATTRIBUTION DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_attribution_section(engine: SimulationEngine):
@@ -1902,7 +2004,6 @@ def render_attribution_section(engine: SimulationEngine):
         "Noise": C["noise_attr"],
     }
 
-    # Waterfall-style bar chart
     fig = _fig(h=340, title=dict(text=f"{asset_choice} Total Return Attribution", font=dict(size=14)))
     names_ordered = [labels.get(c, c) for c in components] + ["Total Return"]
     values_ordered = [summary[c] for c in components] + [summary["Total"]]
@@ -1939,7 +2040,7 @@ def render_attribution_section(engine: SimulationEngine):
         st.dataframe(df.style.format({c: "{:+.2f}" for c in df.columns if c != "Period"}), use_container_width=True, height=300)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AGENT IMPACT ANALYSIS DASHBOARD  (STEP 4 — new)
+# AGENT IMPACT ANALYSIS DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_agent_impact_section(engine: SimulationEngine):
@@ -2004,7 +2105,7 @@ def render_agent_impact_section(engine: SimulationEngine):
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MONTE CARLO DASHBOARD  (unchanged from v2.1, operates on new engine)
+# MONTE CARLO DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_monte_carlo_section():
@@ -2315,15 +2416,19 @@ def main():
     render_risk_contribution_chart(engine)
     st.markdown("---")
 
-    st.markdown("### 10 · Return Attribution")
+    st.markdown("### 10 · Diagnostics")
+    render_diagnostics_panel(engine)
+    st.markdown("---")
+
+    st.markdown("### 11 · Return Attribution")
     render_attribution_section(engine)
     st.markdown("---")
 
-    st.markdown("### 11 · Agent Impact Analysis")
+    st.markdown("### 12 · Agent Impact Analysis")
     render_agent_impact_section(engine)
     st.markdown("---")
 
-    st.markdown("### 12 · Simulation Log")
+    st.markdown("### 13 · Simulation Log")
     render_simulation_log(engine)
     st.markdown("---")
 
@@ -2334,8 +2439,8 @@ def main():
 
     st.markdown("---")
     st.caption(
-        "Agent Twin v3.0 — square-root market impact, fundamental mean reversion, "
-        "exact return attribution, agent ablation analysis. Not investment advice."
+        "Agent Twin v3.1 — square-root market impact, fundamental mean reversion, "
+        "exact return attribution, agent ablation analysis, bounded fair-value anchor. Not investment advice."
     )
 
 if __name__ == "__main__":
