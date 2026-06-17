@@ -1708,76 +1708,97 @@ def render_monte_carlo_section():
                 unsafe_allow_html=True)
 
     # ── Part 4: Economic Dominance Score ─────────────────────────────────────
-    st.markdown("---")
-    st.markdown("##### 📊  Economic Dominance Score")
-    # Use the single-run engine if available; otherwise run seed 0
-    engine = st.session_state.get("engine")
-    if engine is None:
-        if scenario_name and scenario_name in SCENARIOS:
-            p = SCENARIOS[scenario_name]
-            env_ed = MacroEnvironment(**p)
-        else:
-            env_ed = _make_env()
-        engine = SimulationEngine(env_ed, periods=st.session_state["periods"], seed=0)
-        engine.run()
+st.markdown("---")
+st.markdown("##### 📊  Economic Dominance Score")
 
-    dom = compute_economic_dominance(engine)
+# Use the single-run engine if available; otherwise run seed 0
+engine = st.session_state.get("engine")
+if engine is None:
+    if scenario_name and scenario_name in SCENARIOS:
+        p = SCENARIOS[scenario_name]
+        env_ed = MacroEnvironment(**p)
+    else:
+        env_ed = _make_env()
+    engine = SimulationEngine(env_ed, periods=st.session_state["periods"], seed=0)
+    engine.run()
 
-    if dom["r2"] is not None:
-        sig = dom["signal_pct"]
-        noise = dom["noise_pct"]
+dom = compute_economic_dominance(engine)
 
-        col1, col2, col3 = st.columns(3)
-        col1.markdown(
-            f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-            f"<div class='metric-label'>Economic Signal Strength</div>"
-            f"<div class='metric-value' style='color:{C[\"green\"] if sig > 40 else C[\"amber\"] if sig > 25 else C[\"red\"]};'>{sig:.1f}%</div>"
-            f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div></div>",
+if dom["r2"] is not None:
+    sig = dom["signal_pct"]
+    noise = dom["noise_pct"]
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.markdown(
+        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
+        f"<div class='metric-label'>Economic Signal Strength</div>"
+        f"<div class='metric-value'>{sig:.1f}%</div>"
+        f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div></div>",
+        unsafe_allow_html=True)
+
+    col2.markdown(
+        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
+        f"<div class='metric-label'>Noise Contribution</div>"
+        f"<div class='metric-value'>{noise:.1f}%</div>"
+        f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div></div>",
+        unsafe_allow_html=True)
+
+    r2_bars = dom.get("asset_r2", {})
+
+    col3.markdown(
+        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
+        f"<div class='metric-label'>Per-Asset R²</div>"
+        + "".join(
+            f"<div style='font-family:monospace;font-size:.85rem;margin-top:.2rem;'>"
+            f"{a}: {v*100:.1f}%</div>"
+            for a, v in r2_bars.items()
+        )
+        + "</div>",
+        unsafe_allow_html=True)
+
+    if dom["warning"]:
+        st.markdown(
+            f"<div style='background:#3d1210;border:1px solid {C['red']};border-radius:6px;padding:.7rem 1rem;margin-top:.5rem;'>"
+            f"<span style='color:{C['red']};font-family:monospace;font-weight:700;'>⚠ NOISE DOMINANCE WARNING</span>"
+            f"<span style='color:{C['text_dim']};font-size:.85rem;font-family:monospace;'> — Noise explains {noise:.1f}% of variance. "
+            "Economic fundamentals are insufficiently dominant. Consider reducing stochastic noise parameters or increasing simulation length.</span>"
+            "</div>",
             unsafe_allow_html=True)
-        col2.markdown(
-            f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-            f"<div class='metric-label'>Noise Contribution</div>"
-            f"<div class='metric-value' style='color:{C[\"red\"] if noise > 70 else C[\"amber\"] if noise > 55 else C[\"green\"]};'>{noise:.1f}%</div>"
-            f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div></div>",
+    else:
+        st.markdown(
+            f"<div style='background:{C['green_dim']};border:1px solid {C['green']};border-radius:6px;padding:.5rem 1rem;margin-top:.5rem;'>"
+            f"<span style='color:{C['green']};font-family:monospace;font-size:.85rem;'>✓ Economic fundamentals are sufficiently dominant ({sig:.1f}% of variance explained).</span>"
+            "</div>",
             unsafe_allow_html=True)
 
-        r2_bars = dom.get("asset_r2", {})
-        col3.markdown(
-            f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-            f"<div class='metric-label'>Per-Asset R²</div>"
-            + "".join(
-                f"<div style='font-family:monospace;font-size:.85rem;margin-top:.2rem;'>"
-                f"{a}: <span style='color:{C[\"green\"] if v>0.35 else C[\"amber\"] if v>0.2 else C[\"red\"]};'>{v*100:.1f}%</span></div>"
-                for a, v in r2_bars.items()
-            )
-            + "</div>",
-            unsafe_allow_html=True)
+    # Small bar chart
+    fig_dom = _fig(h=200, title=dict(text="Per-Asset: Economic Signal vs Noise", font=dict(size=12)))
+    assets_list = list(r2_bars.keys())
+    sig_vals = [r2_bars[a] * 100 for a in assets_list]
+    noise_vals = [100 - v for v in sig_vals]
 
-        if dom["warning"]:
-            st.markdown(
-                f"<div style='background:#3d1210;border:1px solid {C[\"red\"]};border-radius:6px;padding:.7rem 1rem;margin-top:.5rem;'>"
-                f"<span style='color:{C[\"red\"]};font-family:monospace;font-weight:700;'>⚠ NOISE DOMINANCE WARNING</span>"
-                f"<span style='color:{C[\"text_dim\"]};font-size:.85rem;font-family:monospace;'> — Noise explains {noise:.1f}% of variance. "
-                "Economic fundamentals are insufficiently dominant. Consider reducing stochastic noise parameters or increasing simulation length.</span>"
-                "</div>",
-                unsafe_allow_html=True)
-        else:
-            st.markdown(
-                f"<div style='background:{C[\"green_dim\"]};border:1px solid {C[\"green\"]};border-radius:6px;padding:.5rem 1rem;margin-top:.5rem;'>"
-                f"<span style='color:{C[\"green\"]};font-family:monospace;font-size:.85rem;'>✓ Economic fundamentals are sufficiently dominant ({sig:.1f}% of variance explained).</span>"
-                "</div>",
-                unsafe_allow_html=True)
+    fig_dom.add_trace(go.Bar(
+        x=assets_list,
+        y=sig_vals,
+        name="Signal",
+        marker_color=C["green"],
+        opacity=0.8))
 
-        # Small bar chart
-        fig_dom = _fig(h=200, title=dict(text="Per-Asset: Economic Signal vs Noise", font=dict(size=12)))
-        assets_list = list(r2_bars.keys())
-        sig_vals  = [r2_bars[a]*100 for a in assets_list]
-        noise_vals = [100 - v for v in sig_vals]
-        fig_dom.add_trace(go.Bar(x=assets_list, y=sig_vals,  name="Signal", marker_color=C["green"], opacity=0.8))
-        fig_dom.add_trace(go.Bar(x=assets_list, y=noise_vals, name="Noise",  marker_color=C["red"],   opacity=0.6))
-        fig_dom.update_layout(barmode="stack", yaxis_title="% of Variance",
-                              yaxis=dict(range=[0,100], **LAYOUT["yaxis"]))
-        st.plotly_chart(fig_dom, use_container_width=True)
+    fig_dom.add_trace(go.Bar(
+        x=assets_list,
+        y=noise_vals,
+        name="Noise",
+        marker_color=C["red"],
+        opacity=0.6))
+
+    fig_dom.update_layout(
+        barmode="stack",
+        yaxis_title="% of Variance",
+        yaxis=dict(range=[0, 100], **LAYOUT["yaxis"])
+    )
+
+    st.plotly_chart(fig_dom, use_container_width=True)
 
     # ── Part 5: Robustness Dashboard ─────────────────────────────────────────
     st.markdown("---")
