@@ -987,60 +987,69 @@ def run_consistency_tests(mc_results: Dict, scenario_name: str) -> List[Dict]:
     return tests
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Part 4: Economic Dominance Score ─────────────────────────────────────
-st.markdown("---")
-st.markdown("##### 📊 Economic Dominance Score")
+# PART 4: ECONOMIC DOMINANCE SCORE
+# ══════════════════════════════════════════════════════════════════════════════
 
-engine = st.session_state.get("engine")
+def compute_economic_dominance(engine: SimulationEngine) -> Dict:
+    """
+    Proxy for economic signal strength:
+    R² of a simple linear model: macro vars → asset return per period.
+    Uses GDP growth, inflation, interest rate as predictors for stock returns.
+    """
+    env_hist = engine.market.env_history
+    prices   = engine.market.assets["Stocks"].price_history
 
-if engine is None:
-    env_ed = _make_env()
-    engine = SimulationEngine(
-        env_ed,
-        periods=st.session_state["periods"],
-        seed=0
-    )
-    engine.run()
+    if len(prices) < 10 or len(env_hist) < 5:
+        return {"r2": None, "signal_pct": None, "noise_pct": None, "warning": False}
 
-dom = compute_economic_dominance(engine)
+    min_len = min(len(prices) - 1, len(env_hist))
+    rets = [(prices[i] / prices[i-1] - 1) * 100 for i in range(1, min_len + 1)]
+    gdps  = [env_hist[i].gdp_growth   for i in range(min_len)]
+    infs  = [env_hist[i].inflation     for i in range(min_len)]
+    rates = [env_hist[i].interest_rate for i in range(min_len)]
+    reg_enc = [1 if env_hist[i].regime == "Expansion" else
+               -1 if env_hist[i].regime == "Recession" else 0
+               for i in range(min_len)]
 
-if dom["r2"] is not None:
-    sig = dom["signal_pct"]
-    noise = dom["noise_pct"]
+    y = np.array(rets)
+    X = np.column_stack([gdps, infs, rates, reg_enc, np.ones(min_len)])
 
-    col1, col2, col3 = st.columns(3)
+    try:
+        coeffs, residuals, rank, sv = np.linalg.lstsq(X, y, rcond=None)
+        y_hat = X @ coeffs
+        ss_res = np.sum((y - y_hat) ** 2)
+        ss_tot = np.sum((y - np.mean(y)) ** 2)
+        r2 = max(0.0, 1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+    except Exception:
+        r2 = 0.0
 
-    col1.markdown(
-        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-        f"<div class='metric-label'>Economic Signal Strength</div>"
-        f"<div class='metric-value'>{sig:.1f}%</div>"
-        f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+    signal_pct = r2 * 100
+    noise_pct  = (1 - r2) * 100
+    warning    = noise_pct > 70  # noise explains >70% → issue warning
 
-    col2.markdown(
-        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-        f"<div class='metric-label'>Noise Contribution</div>"
-        f"<div class='metric-value'>{noise:.1f}%</div>"
-        f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+    # Per-asset breakdown
+    asset_r2 = {}
+    for asset_name in ["Stocks", "Bonds", "Gold"]:
+        ap = engine.market.assets[asset_name].price_history
+        min_la = min(len(ap) - 1, len(env_hist))
+        ar = [(ap[i] / ap[i-1] - 1) * 100 for i in range(1, min_la + 1)]
+        ya = np.array(ar)
+        Xa = np.column_stack([gdps[:min_la], infs[:min_la], rates[:min_la],
+                               reg_enc[:min_la], np.ones(min_la)])
+        try:
+            ca, _, _, _ = np.linalg.lstsq(Xa, ya, rcond=None)
+            yh = Xa @ ca
+            ss_r = np.sum((ya - yh) ** 2)
+            ss_t = np.sum((ya - np.mean(ya)) ** 2)
+            asset_r2[asset_name] = max(0.0, 1 - ss_r / ss_t) if ss_t > 0 else 0.0
+        except Exception:
+            asset_r2[asset_name] = 0.0
 
-    r2_bars = dom.get("asset_r2", {})
+    return {
+        "r2": r2, "signal_pct": signal_pct, "noise_pct": noise_pct,
+        "warning": warning, "asset_r2": asset_r2
+    }
 
-    col3.markdown(
-        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-        f"<div class='metric-label'>Per-Asset R²</div>"
-        + "".join(
-            f"<div style='font-family:monospace;font-size:.85rem;margin-top:.2rem;'>"
-            f"{a}: {v*100:.1f}%</div>"
-            for a, v in r2_bars.items()
-        )
-        + "</div>",
-        unsafe_allow_html=True,
-    )
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 5: ROBUSTNESS / CONFIDENCE LEVEL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1698,111 +1707,77 @@ def render_monte_carlo_section():
                 f"</div>",
                 unsafe_allow_html=True)
 
-# ── Part 4: Economic Dominance Score ─────────────────────────────────────
-st.markdown("---")
-st.markdown("##### 📊 Economic Dominance Score")
+    # ── Part 4: Economic Dominance Score ─────────────────────────────────────
+    st.markdown("---")
+    st.markdown("##### 📊  Economic Dominance Score")
+    # Use the single-run engine if available; otherwise run seed 0
+    engine = st.session_state.get("engine")
+    if engine is None:
+        if scenario_name and scenario_name in SCENARIOS:
+            p = SCENARIOS[scenario_name]
+            env_ed = MacroEnvironment(**p)
+        else:
+            env_ed = _make_env()
+        engine = SimulationEngine(env_ed, periods=st.session_state["periods"], seed=0)
+        engine.run()
 
-engine = st.session_state.get("engine")
+    dom = compute_economic_dominance(engine)
 
-if engine is None:
-    run_simulation()
-    engine = st.session_state["engine"]
+    if dom["r2"] is not None:
+        sig = dom["signal_pct"]
+        noise = dom["noise_pct"]
 
-dom = compute_economic_dominance(engine)
+        col1, col2, col3 = st.columns(3)
+        col1.markdown(
+            f"<div class='panel' style='text-align:center;padding:.7rem;'>"
+            f"<div class='metric-label'>Economic Signal Strength</div>"
+            f"<div class='metric-value' style='color:{C[\"green\"] if sig > 40 else C[\"amber\"] if sig > 25 else C[\"red\"]};'>{sig:.1f}%</div>"
+            f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div></div>",
+            unsafe_allow_html=True)
+        col2.markdown(
+            f"<div class='panel' style='text-align:center;padding:.7rem;'>"
+            f"<div class='metric-label'>Noise Contribution</div>"
+            f"<div class='metric-value' style='color:{C[\"red\"] if noise > 70 else C[\"amber\"] if noise > 55 else C[\"green\"]};'>{noise:.1f}%</div>"
+            f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div></div>",
+            unsafe_allow_html=True)
 
-if dom["r2"] is not None:
-    sig = dom["signal_pct"]
-    noise = dom["noise_pct"]
+        r2_bars = dom.get("asset_r2", {})
+        col3.markdown(
+            f"<div class='panel' style='text-align:center;padding:.7rem;'>"
+            f"<div class='metric-label'>Per-Asset R²</div>"
+            + "".join(
+                f"<div style='font-family:monospace;font-size:.85rem;margin-top:.2rem;'>"
+                f"{a}: <span style='color:{C[\"green\"] if v>0.35 else C[\"amber\"] if v>0.2 else C[\"red\"]};'>{v*100:.1f}%</span></div>"
+                for a, v in r2_bars.items()
+            )
+            + "</div>",
+            unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns(3)
+        if dom["warning"]:
+            st.markdown(
+                f"<div style='background:#3d1210;border:1px solid {C[\"red\"]};border-radius:6px;padding:.7rem 1rem;margin-top:.5rem;'>"
+                f"<span style='color:{C[\"red\"]};font-family:monospace;font-weight:700;'>⚠ NOISE DOMINANCE WARNING</span>"
+                f"<span style='color:{C[\"text_dim\"]};font-size:.85rem;font-family:monospace;'> — Noise explains {noise:.1f}% of variance. "
+                "Economic fundamentals are insufficiently dominant. Consider reducing stochastic noise parameters or increasing simulation length.</span>"
+                "</div>",
+                unsafe_allow_html=True)
+        else:
+            st.markdown(
+                f"<div style='background:{C[\"green_dim\"]};border:1px solid {C[\"green\"]};border-radius:6px;padding:.5rem 1rem;margin-top:.5rem;'>"
+                f"<span style='color:{C[\"green\"]};font-family:monospace;font-size:.85rem;'>✓ Economic fundamentals are sufficiently dominant ({sig:.1f}% of variance explained).</span>"
+                "</div>",
+                unsafe_allow_html=True)
 
-    col1.markdown(
-        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-        f"<div class='metric-label'>Economic Signal Strength</div>"
-        f"<div class='metric-value'>{sig:.1f}%</div>"
-        f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div>"
-        f"</div>",
-        unsafe_allow_html=True
-    )
-
-    col2.markdown(
-        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-        f"<div class='metric-label'>Noise Contribution</div>"
-        f"<div class='metric-value'>{noise:.1f}%</div>"
-        f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div>"
-        f"</div>",
-        unsafe_allow_html=True
-    )
-
-    r2_bars = dom.get("asset_r2", {})
-
-    col3.markdown(
-        f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-        f"<div class='metric-label'>Per-Asset R²</div>"
-        + "".join(
-            f"<div style='font-family:monospace;font-size:.85rem;margin-top:.2rem;'>"
-            f"{a}: {v*100:.1f}%</div>"
-            for a, v in r2_bars.items()
-        )
-        + "</div>",
-        unsafe_allow_html=True
-    )
-
-    if dom["warning"]:
-        st.markdown(
-            f"<div style='background:#3d1210;border:1px solid {C['red']};border-radius:6px;padding:.7rem 1rem;margin-top:.5rem;'>"
-            f"<span style='color:{C['red']};font-family:monospace;font-weight:700;'>⚠ NOISE DOMINANCE WARNING</span>"
-            f"<span style='color:{C['text_dim']};font-size:.85rem;font-family:monospace;'> — Noise explains {noise:.1f}% of variance. Economic fundamentals are insufficiently dominant.</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-    else:
-        st.markdown(
-            f"<div style='background:{C['green_dim']};border:1px solid {C['green']};border-radius:6px;padding:.5rem 1rem;margin-top:.5rem;'>"
-            f"<span style='color:{C['green']};font-family:monospace;font-size:.85rem;'>✓ Economic fundamentals are sufficiently dominant ({sig:.1f}% of variance explained).</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-
-    fig_dom = _fig(
-        h=200,
-        title=dict(
-            text="Per-Asset: Economic Signal vs Noise",
-            font=dict(size=12)
-        )
-    )
-
-    assets_list = list(r2_bars.keys())
-    sig_vals = [r2_bars[a] * 100 for a in assets_list]
-    noise_vals = [100 - v for v in sig_vals]
-
-    fig_dom.add_trace(
-        go.Bar(
-            x=assets_list,
-            y=sig_vals,
-            name="Signal",
-            marker_color=C["green"],
-            opacity=0.8
-        )
-    )
-
-    fig_dom.add_trace(
-        go.Bar(
-            x=assets_list,
-            y=noise_vals,
-            name="Noise",
-            marker_color=C["red"],
-            opacity=0.6
-        )
-    )
-
-    fig_dom.update_layout(
-        barmode="stack",
-        yaxis_title="% of Variance",
-        yaxis=dict(range=[0, 100], **LAYOUT["yaxis"])
-    )
-
-    st.plotly_chart(fig_dom, use_container_width=True)
+        # Small bar chart
+        fig_dom = _fig(h=200, title=dict(text="Per-Asset: Economic Signal vs Noise", font=dict(size=12)))
+        assets_list = list(r2_bars.keys())
+        sig_vals  = [r2_bars[a]*100 for a in assets_list]
+        noise_vals = [100 - v for v in sig_vals]
+        fig_dom.add_trace(go.Bar(x=assets_list, y=sig_vals,  name="Signal", marker_color=C["green"], opacity=0.8))
+        fig_dom.add_trace(go.Bar(x=assets_list, y=noise_vals, name="Noise",  marker_color=C["red"],   opacity=0.6))
+        fig_dom.update_layout(barmode="stack", yaxis_title="% of Variance",
+                              yaxis=dict(range=[0,100], **LAYOUT["yaxis"]))
+        st.plotly_chart(fig_dom, use_container_width=True)
 
     # ── Part 5: Robustness Dashboard ─────────────────────────────────────────
     st.markdown("---")
