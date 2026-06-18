@@ -1,3 +1,4 @@
 pandas
-yfinance
 numpy
+requests
+streamlit
