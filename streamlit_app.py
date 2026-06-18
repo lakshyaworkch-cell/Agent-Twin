@@ -20,6 +20,7 @@ import os
 import requests
 import pandas as pd
 import numpy as np
+import streamlit as st
 
 pd.set_option("display.max_rows", None)
 pd.set_option("display.max_columns", None)
@@ -37,7 +38,7 @@ FORECAST_YEARS = 5
 # On Streamlit Cloud, store in .streamlit/secrets.toml as:
 #   FMP_API_KEY = "your_key_here"
 # Then access via:  import streamlit as st; KEY = st.secrets["FMP_API_KEY"]
-FMP_API_KEY  = os.environ.get("FMP_API_KEY", "demo")
+FMP_API_KEY = st.secrets["FMP_API_KEY"]
 # ============================================================
 
 
