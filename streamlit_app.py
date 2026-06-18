@@ -2,15 +2,6 @@
 ================================================================================
   INSTITUTIONAL-GRADE DCF MODEL  |  JPMorgan Equity Research Style
 ================================================================================
-  Instructions:
-    1. Set TICKER and WACC below
-    2. Set FMP_API_KEY  (free at https://financialmodelingprep.com — 250 calls/day)
-       OR set it as a Streamlit secret: st.secrets["FMP_API_KEY"]
-    3. Run: python jpmorgan_dcf.py   OR   streamlit run streamlit_app.py
-
-  Data source: Financial Modeling Prep API  (replaces yfinance which is
-  permanently rate-limited on Streamlit Cloud shared IPs)
-================================================================================
 """
 
 import warnings
@@ -30,14 +21,10 @@ pd.set_option("display.float_format", lambda x: f"{x:,.2f}")
 # ============================================================
 # CHANGE THESE INPUTS
 # ============================================================
-TICKER       = "GOOG"
-WACC         = 0.112
+TICKER         = "GOOG"
+WACC           = 0.112
 FORECAST_YEARS = 5
 
-# Free API key from https://financialmodelingprep.com
-# On Streamlit Cloud, store in .streamlit/secrets.toml as:
-#   FMP_API_KEY = "your_key_here"
-# Then access via:  import streamlit as st; KEY = st.secrets["FMP_API_KEY"]
 FMP_API_KEY = st.secrets["FMP_API_KEY"]
 # ============================================================
 
@@ -45,10 +32,9 @@ FMP_API_KEY = st.secrets["FMP_API_KEY"]
 # -------------------------------------------------------------
 # FMP API HELPERS
 # -------------------------------------------------------------
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+FMP_BASE = "https://financialmodelingprep.com/api/v4"
 
 def fmp_get(endpoint, params=None):
-    """GET from FMP API, raise on error."""
     p = {"apikey": FMP_API_KEY}
     if params:
         p.update(params)
@@ -62,41 +48,37 @@ def fmp_get(endpoint, params=None):
         raise ValueError(f"FMP API error: {data['Error Message']}")
     return data
 
-
 def fmp_income(ticker, limit=4):
-    return fmp_get(f"income-statement/{ticker}", {"limit": limit, "period": "annual"})
+    data = fmp_get("income-statement", {"symbol": ticker, "limit": limit, "period": "annual"})
+    return data.get("financials", data) if isinstance(data, dict) else data
 
 def fmp_cashflow(ticker, limit=4):
-    return fmp_get(f"cash-flow-statement/{ticker}", {"limit": limit, "period": "annual"})
+    data = fmp_get("cash-flow-statement", {"symbol": ticker, "limit": limit, "period": "annual"})
+    return data.get("financials", data) if isinstance(data, dict) else data
 
 def fmp_balance(ticker, limit=4):
-    return fmp_get(f"balance-sheet-statement/{ticker}", {"limit": limit, "period": "annual"})
+    data = fmp_get("balance-sheet-statement", {"symbol": ticker, "limit": limit, "period": "annual"})
+    return data.get("financials", data) if isinstance(data, dict) else data
 
 def fmp_profile(ticker):
-    data = fmp_get(f"profile/{ticker}")
+    data = fmp_get("company/profile", {"symbol": ticker})
+    if isinstance(data, dict):
+        return data.get("profile", data)
     return data[0] if data else {}
 
 def fmp_quote(ticker):
-    data = fmp_get(f"quote/{ticker}")
-    return data[0] if data else {}
+    data = fmp_get("quote", {"symbol": ticker})
+    return data[0] if isinstance(data, list) and data else {}
 
 def fmp_ratios(ticker):
-    data = fmp_get(f"ratios-ttm/{ticker}")
-    return data[0] if data else {}
+    data = fmp_get("ratios-ttm", {"symbol": ticker})
+    return data[0] if isinstance(data, list) and data else {}
 
 def fmp_key_metrics(ticker):
-    data = fmp_get(f"key-metrics-ttm/{ticker}")
-    return data[0] if data else {}
+    data = fmp_get("key-metrics-ttm", {"symbol": ticker})
+    return data[0] if isinstance(data, list) and data else {}
 
 def fetch_treasury_rate():
-    """10Y US Treasury from FMP economic indicators."""
-    try:
-        data = fmp_get("economic", {"name": "10YearTreasuryRate"})
-        if data:
-            return float(data[0]["value"]) / 100
-    except Exception:
-        pass
-    # Fallback: FRED or hardcoded
     try:
         r = requests.get(
             "https://api.stlouisfed.org/fred/series/observations",
@@ -107,7 +89,7 @@ def fetch_treasury_rate():
         val = r.json()["observations"][0]["value"]
         return float(val) / 100
     except Exception:
-        return 0.04  # hard fallback
+        return 0.04
 
 
 # -------------------------------------------------------------
@@ -175,12 +157,10 @@ if not inc_raw:
         "Check your FMP_API_KEY and that the ticker is valid."
     )
 
-# FMP returns newest-first; reverse to oldest-first
 inc_raw  = list(reversed(inc_raw))
 cf_raw   = list(reversed(cf_raw))
 bal_raw  = list(reversed(bal_raw))
 
-# Align years across statements (inner join on calendarYear)
 inc_years  = {r["calendarYear"] for r in inc_raw}
 cf_years   = {r["calendarYear"] for r in cf_raw}
 bal_years  = {r["calendarYear"] for r in bal_raw}
@@ -248,7 +228,6 @@ for yr in common_yrs:
 
 df = pd.DataFrame(rows).sort_values("Year").reset_index(drop=True)
 
-# Derived metrics
 df["NWC"]           = df["Current_Assets"] - df["Current_Liab"]
 df["DELTA_NWC"]     = df["NWC"].diff()
 df["EBIT_Margin"]   = df["EBIT"]   / df["Revenue"].replace(0, np.nan)
@@ -272,7 +251,7 @@ df["Rev_Growth"] = df["Revenue"].pct_change()
 
 
 # -------------------------------------------------------------
-# 4. MARKET / COMPANY DATA  (from profile + quote + ratios)
+# 4. MARKET / COMPANY DATA
 # -------------------------------------------------------------
 company_name   = profile.get("companyName", TICKER)
 sector         = profile.get("sector",   "N/A")
@@ -280,10 +259,9 @@ industry       = profile.get("industry", "N/A")
 current_price  = safe(quote.get("price"))
 week52_low     = safe(quote.get("yearLow"))
 week52_high    = safe(quote.get("yearHigh"))
-shares_out     = safe(quote.get("sharesOutstanding", 0)) / 1e9   # billions
+shares_out     = safe(quote.get("sharesOutstanding", 0)) / 1e9
 market_cap     = safe(quote.get("marketCap", 0))         / 1e9
 
-# Net debt from latest balance sheet
 latest_bal     = bal_by_yr[common_yrs[-1]]
 NET_DEBT       = (safe(latest_bal.get("totalDebt", 0)) -
                   safe(latest_bal.get("cashAndCashEquivalents", 0))) / 1e9
@@ -292,11 +270,10 @@ SHARES         = shares_out if shares_out > 0 else market_cap / current_price
 
 fwd_pe         = safe(ratios.get("peRatioTTM"))
 ev_ebitda_mult = safe(metrics.get("evToEbitdaTTM") or ratios.get("enterpriseValueMultipleTTM"))
-rev_growth_fwd = safe(profile.get("revenueGrowth"))   # not always present
+rev_growth_fwd = safe(profile.get("revenueGrowth"))
 
-# Analyst fwd revenue growth fallback
 if np.isnan(rev_growth_fwd) or not (0.0 < rev_growth_fwd < 0.60):
-    rev_growth_fwd = np.nan   # will fall back to CAGR below
+    rev_growth_fwd = np.nan
 
 
 # -------------------------------------------------------------
@@ -363,8 +340,8 @@ prev_pay = df["Payables"].iloc[-1];    prev_pay = (dpo_hist/365)*last_rev if np.
 
 forecast_rows = []
 for i in range(FORECAST_YEARS):
-    yr   = last_yr + i + 1
-    rev  = prev_rev * (1 + REVENUE_GROWTH[i])
+    yr    = last_yr + i + 1
+    rev   = prev_rev * (1 + REVENUE_GROWTH[i])
     ebit  = rev * EBIT_MARGINS[i]
     nopat = ebit * (1 - TAX_RATE)
     capex = rev * maint_capex_pct + (rev - prev_rev) * growth_capex_pct
