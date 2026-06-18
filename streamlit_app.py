@@ -2395,4 +2395,4 @@ with tabs[6]:
             f'<div class="panel" style="font-family:IBM Plex Sans,sans-serif;'
             f'font-size:.88rem;line-height:1.6;color:{C["text"]};">{para}</div>',
             unsafe_allow_html=True)
-            unsafe_allow_html=True)
+            
