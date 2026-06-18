@@ -53,9 +53,12 @@ def fmp_get(endpoint, params=None):
     if params:
         p.update(params)
     r = requests.get(f"{FMP_BASE}/{endpoint}", params=p, timeout=15)
-    r.raise_for_status()
+    if not r.ok:
+        st.error(f"FMP API error {r.status_code} on /{endpoint}: {r.text[:500]}")
+        raise ValueError(f"HTTP {r.status_code}: {r.text[:200]}")
     data = r.json()
     if isinstance(data, dict) and "Error Message" in data:
+        st.error(f"FMP error: {data['Error Message']}")
         raise ValueError(f"FMP API error: {data['Error Message']}")
     return data
 
