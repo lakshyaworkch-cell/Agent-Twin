@@ -1559,6 +1559,13 @@ def generate_institutional_summary(engine: SimulationEngine) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# STREAMLIT UI  —  Agent Twin v3.1
+# Paste this entire block at the END of your existing agent_twin_v3.py file,
+# replacing the "st.write('App loaded successfully')" test line you added.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ──────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1798,7 +1805,7 @@ with tabs[0]:
             line=dict(color=color, width=1, dash="dot"),
             opacity=0.5))
     fig.update_layout(**LAYOUT, height=340, title="Price vs Fair Value (base=100)",
-                      legend=dict(orientation="h", y=-0.18))
+                      legend=dict(orientation="h", yanchor="top", y=-0.15))
     st.plotly_chart(fig, use_container_width=True)
 
     # Regime shading overlay
@@ -1816,7 +1823,7 @@ with tabs[0]:
         fig2.add_trace(go.Scatter(x=periods_x, y=[e.gdp_growth for e in env_hist],
                                   name="GDP Growth", line=dict(color=C["green"], width=1.5)))
         fig2.update_layout(**LAYOUT, height=260, title="Macro indicators",
-                           legend=dict(orientation="h", y=-0.22))
+                           legend=dict(orientation="h", yanchor="top", y=-0.15))
         st.plotly_chart(fig2, use_container_width=True)
 
     with c2:
@@ -1830,7 +1837,7 @@ with tabs[0]:
                 line=dict(color=color, width=0),
                 fillcolor=color + "88"))
         fig3.update_layout(**LAYOUT, height=260, title="Regime probability",
-                           legend=dict(orientation="h", y=-0.22),
+                           legend=dict(orientation="h", yanchor="top", y=-0.15),
                            yaxis=dict(tickformat=".0%"))
         st.plotly_chart(fig3, use_container_width=True)
 
@@ -1847,7 +1854,7 @@ with tabs[0]:
     fig4.add_trace(go.Scatter(y=sg_corr.tolist(), name="Stocks–Gold",
                               line=dict(color=C["gold"], width=1.5)))
     fig4.add_hline(y=0, line=dict(color=C["border"], dash="dot"))
-    fig4.update_layout(**LAYOUT, height=220, legend=dict(orientation="h", y=-0.22))
+    fig4.update_layout(**LAYOUT, height=220, legend=dict(orientation="h", yanchor="top", y=-0.15))
     st.plotly_chart(fig4, use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1882,7 +1889,7 @@ with tabs[1]:
                     name=asset, stackgroup="one",
                     line=dict(color=color, width=0), fillcolor=color + "88"))
             fig_pa.update_layout(**LAYOUT, height=160, title="Allocation",
-                                 legend=dict(orientation="h", y=-0.28),
+                                 legend=dict(orientation="h", yanchor="top", y=-0.15),
                                  margin=dict(l=32, r=8, t=32, b=8))
             st.plotly_chart(fig_pa, use_container_width=True)
 
@@ -1908,7 +1915,7 @@ with tabs[1]:
             line=dict(color=C["amber"], width=1.5, dash="dash")))
         fig_lev.add_hline(y=1, line=dict(color=C["border"], dash="dot"))
         fig_lev.update_layout(**LAYOUT, height=160, title="Leverage (gross/net)",
-                              legend=dict(orientation="h", y=-0.28),
+                              legend=dict(orientation="h", yanchor="top", y=-0.15),
                               margin=dict(l=32, r=8, t=32, b=8))
         st.plotly_chart(fig_lev, use_container_width=True)
 
@@ -1921,7 +1928,7 @@ with tabs[1]:
             line=dict(color=C["blue"], width=1.5)))
         fig_sig.add_hline(y=0, line=dict(color=C["border"], dash="dot"))
         fig_sig.update_layout(**LAYOUT, height=160, title="Signals",
-                              legend=dict(orientation="h", y=-0.28),
+                              legend=dict(orientation="h", yanchor="top", y=-0.15),
                               margin=dict(l=32, r=8, t=32, b=8))
         st.plotly_chart(fig_sig, use_container_width=True)
 
@@ -1946,7 +1953,7 @@ with tabs[1]:
             y=retail.fear_history, name="Fear",
             line=dict(color=C["red"], width=1.5)))
         fig_fg.update_layout(**LAYOUT, height=160, title="Fear / Greed",
-                             legend=dict(orientation="h", y=-0.28),
+                             legend=dict(orientation="h", yanchor="top", y=-0.15),
                              margin=dict(l=32, r=8, t=32, b=8))
         st.plotly_chart(fig_fg, use_container_width=True)
 
@@ -1959,7 +1966,7 @@ with tabs[1]:
                     name=asset, stackgroup="one",
                     line=dict(color=color, width=0), fillcolor=color + "88"))
             fig_ra.update_layout(**LAYOUT, height=160, title="Allocation",
-                                 legend=dict(orientation="h", y=-0.28),
+                                 legend=dict(orientation="h", yanchor="top", y=-0.15),
                                  margin=dict(l=32, r=8, t=32, b=8))
             st.plotly_chart(fig_ra, use_container_width=True)
 
@@ -2051,7 +2058,7 @@ with tabs[2]:
     fig_attr.add_trace(go.Scatter(
         x=attr_df["Period"], y=attr_df["Total"],
         name="Total", line=dict(color=C["text"], width=1.5, dash="dot")))
-    fig_attr.update_layout(**LAYOUT, height=320, legend=dict(orientation="h", y=-0.2))
+    fig_attr.update_layout(**LAYOUT, height=320, legend=dict(orientation="h", yanchor="top", y=-0.15))
     st.plotly_chart(fig_attr, use_container_width=True)
 
     # Attribution for Bonds and Gold
@@ -2202,7 +2209,7 @@ with tabs[4]:
                       width=2 if label == "Full Model" else 1.2,
                       dash="solid" if label == "Full Model" else "dash")))
     fig_ab2.update_layout(**LAYOUT, height=320,
-                          legend=dict(orientation="h", y=-0.2))
+                          legend=dict(orientation="h", yanchor="top", y=-0.15))
     st.plotly_chart(fig_ab2, use_container_width=True)
 
     # Summary table
@@ -2339,7 +2346,7 @@ with tabs[6]:
             line=dict(color=color, width=1, dash="dot"), opacity=0.5))
     fig_fv.update_layout(**LAYOUT, height=320,
                          title="Fair value vs price (base=100)",
-                         legend=dict(orientation="h", y=-0.2))
+                         legend=dict(orientation="h", yanchor="top", y=-0.15))
     st.plotly_chart(fig_fv, use_container_width=True)
 
     # Raw annual return signal and clipped drift
@@ -2387,4 +2394,5 @@ with tabs[6]:
         st.markdown(
             f'<div class="panel" style="font-family:IBM Plex Sans,sans-serif;'
             f'font-size:.88rem;line-height:1.6;color:{C["text"]};">{para}</div>',
+            unsafe_allow_html=True)
             unsafe_allow_html=True)
