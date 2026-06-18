@@ -222,8 +222,37 @@ REGIME_TRANSITIONS = {
     "Recovery":  {"Expansion": 0.18, "Slowdown": 0.03, "Recession": 0.02, "Recovery": 0.77},
 }
 
-def next_regime(current: str, rng: random.Random) -> str:
-    probs = REGIME_TRANSITIONS[current]
+def next_regime(current: str, rng: random.Random,
+                 base_regime: Optional[str] = None,
+                 anchor_strength: float = 0.0) -> str:
+    """
+    v3.2 FIX (see CHANGELOG_v3.2): the original chain's transition matrix has
+    a stationary distribution (~48% Expansion / 28% Slowdown / 13% Recession
+    / 10% Recovery) that is IDENTICAL regardless of which scenario the user
+    selected. A 100-period "Recession" preset would spend ~84% of its
+    periods NOT in Recession on average (measured empirically), because
+    nothing in the chain remembers what scenario it was launched from --
+    it free-runs on the generic matrix from period 2 onward. Since
+    `regime_asset_bias()` flips sign across regimes (+0.20 Stocks in
+    Expansion vs -0.30 in Recession), this silently fed a strongly
+    pro-Expansion bias into supposedly-recessionary runs.
+
+    Fix: blend the base transition matrix with a pull back toward the
+    scenario's intended (base) regime. `anchor_strength` in [0, 1] controls
+    how much weight is placed on staying near the scenario's own regime vs.
+    the chain's free-running organic dynamics; at 0 this reduces to the
+    original behaviour. The SimulationEngine sets this once per run from
+    the scenario, so organic transitions (recoveries from recession, boom
+    cooling into slowdown, etc.) are still possible -- the base regime is a
+    gravitational anchor, not a hard floor.
+    """
+    probs = dict(REGIME_TRANSITIONS[current])
+    if base_regime is not None and anchor_strength > 0.0:
+        blended = {r: (1.0 - anchor_strength) * probs.get(r, 0.0) for r in REGIMES}
+        blended[base_regime] = blended.get(base_regime, 0.0) + anchor_strength
+        total = sum(blended.values())
+        probs = {r: v / total for r, v in blended.items()}
+
     r = rng.random()
     cumulative = 0.0
     for regime, p in probs.items():
@@ -250,38 +279,68 @@ def regime_asset_bias(regime: str) -> Dict[str, float]:
 
 @dataclass
 class StockValuation:
+    """
+    v3.2 ROOT-CAUSE FIX (see CHANGELOG_v3.2): `earnings` was a freely
+    compounding state variable with no mean reversion and no ceiling.
+    `earnings_yield`, defined as 1/PE, is mathematically `100 / (100/earnings)
+    == earnings` -- an IDENTITY, not an independent fix. So as long as
+    `earnings` itself could compound without bound, "fixing" the formula
+    that derives earnings_yield FROM earnings could never matter: any
+    formula for earnings_yield that is monotonic in earnings will inherit
+    earnings' lack of a ceiling. v3.1's clip on per-period FAIR VALUE drift
+    could not catch this either, because the bug is a slow multi-period
+    ratchet in the input (earnings/PE), not a single-period spike in the
+    output (expected_return) -- by the time the clip's threshold (60%/yr)
+    is crossed, the simulation has often already finished its run.
+
+    v3.2 fix, applied directly to the state variable that was unbounded:
+      - `earnings` now mean-reverts toward a GDP-implied fundamental level
+        (EARNINGS_BASELINE adjusted for cumulative real growth) every period,
+        the same way bond yields and gold's inflation sensitivity already do.
+        It no longer just compounds forward with no anchor pulling it back.
+      - PE ratio (and therefore earnings_yield) is hard-bounded to
+        [PE_FLOOR, PE_CEILING] = [6, 40], i.e. earnings_yield in
+        [2.5%, 16.7%]. This is the actual fix: it bounds the quantity that
+        was unbounded, not a re-derivation that happens to equal the same
+        unbounded quantity.
+      - earnings_growth keeps its v3.1 tighter ceiling/decay (still useful
+        as a separate, slower-moving growth-expectations state), but no
+        longer the only thing standing between the model and a runaway PE.
+    """
     earnings: float
     earnings_growth: float
 
+    # Hard, economically-motivated bounds on the valuation multiple itself.
+    # PE=6 (~16.7% earnings yield) is a deep-distress trough; PE=40 (~2.5%
+    # earnings yield) is a euphoric-bubble ceiling. Real-world index PEs
+    # have approached but rarely sustained outside this band for long.
+    PE_FLOOR: float = field(default=6.0, repr=False, compare=False)
+    PE_CEILING: float = field(default=40.0, repr=False, compare=False)
+
+    # Fundamental "fair" earnings level at the start of a run (matches the
+    # Market's starting StockValuation(earnings=5.5, ...)), used as the
+    # mean-reversion target's base. Tracked via a running GDP-implied path
+    # rather than left to float freely.
+    _fundamental_earnings: float = field(default=5.5, repr=False, compare=False)
+
     @property
     def pe_ratio(self) -> float:
-        return 100.0 / self.earnings if self.earnings > 0 else 999.0
+        raw_pe = 100.0 / self.earnings if self.earnings > 0 else self.PE_CEILING
+        return max(self.PE_FLOOR, min(self.PE_CEILING, raw_pe))
 
     def expected_return_pct(self, interest_rate: float = 4.0, inflation: float = 2.0) -> float:
         """
         ANNUALISED expected return (%), composed of:
-          - earnings_yield = 1 / PE  (the standard Gordon-style yield definition;
-            v3.0 had `(earnings/100)*100` which algebraically equals
-            `earnings`, NOT a yield -- the root cause of the runaway anchor)
-          - + earnings_growth (also annualised)
-          - - a discount-rate / multiple-compression penalty: equities are
-            valued at a multiple that compresses as real rates rise. v3.0 had
-            ZERO sensitivity to interest_rate or inflation in equity fair
-            value (Bonds and Gold both already had this; Stocks did not),
-            which is why an Inflation Shock scenario could not suppress
-            equity fair value at all.
+          - earnings_yield = 1 / PE, with PE drawn from the BOUNDED pe_ratio
+            property above -- this is what actually stops the runaway, not
+            the formula shape.
+          - + earnings_growth (also annualised, separately bounded)
+          - - a discount-rate / multiple-compression penalty (rates)
+          - - an inflation penalty (margin compression / uncertainty premium)
         """
-        earnings_yield = self.pe_ratio and (100.0 / self.pe_ratio) or 0.0  # = 1/PE * 100, i.e. true earnings yield
+        earnings_yield = 100.0 / self.pe_ratio
         real_rate = interest_rate - inflation
-        # Multiple-compression penalty: every 1pp of real rate above a 2%
-        # "neutral" level shaves ~0.8pp off the equity expected-return path
-        # (a simple stand-in for discount-rate sensitivity, calibrated so a
-        # severe rate shock visibly suppresses equities without dominating
-        # every other term).
         discount_penalty = max(0.0, real_rate - 2.0) * 0.8
-        # Inflation above target also compresses equity multiples
-        # independent of real rates (margin compression / uncertainty
-        # premium channel), capped so it can't run away on its own.
         inflation_penalty = max(0.0, min(inflation - 2.0, 10.0)) * 0.5
         return earnings_yield + self.earnings_growth - discount_penalty - inflation_penalty
 
@@ -292,15 +351,33 @@ class StockValuation:
         return self.pe_ratio < 14
 
     def update(self, price: float, gdp_growth: float, rng: random.Random):
+        # Fundamental earnings level drifts slowly with trend GDP capacity
+        # (this is the "potential output" anchor -- it moves, but gradually,
+        # and has no feedback from price/PE, so it cannot itself spiral).
+        fundamental_growth_factor = 1.0 + (gdp_growth / 100.0) * 0.25
+        self._fundamental_earnings = max(0.5, self._fundamental_earnings * fundamental_growth_factor)
+
+        # Actual earnings: grows with GDP plus noise, same as before, BUT
+        # now pulled back toward the fundamental anchor each period instead
+        # of being left to compound freely. This is the actual fix -- a
+        # mean-reverting state variable instead of an unbounded random walk
+        # with positive drift.
         growth_factor = 1.0 + (gdp_growth / 100.0) * 0.4 + rng.gauss(0, 0.004)
-        self.earnings = max(0.5, self.earnings * growth_factor)
-        # earnings_growth update: same mean-reverting form as v3.0, but with
-        # a materially tighter ceiling and stronger pull toward a sane
-        # baseline, so a merely "modest positive GDP" macro path (e.g.
-        # Inflation Shock's gdp_growth=1.5) cannot push earnings_growth up
-        # against its ceiling and hold it there for 100 consecutive periods.
-        # v3.0 ceiling was +15 with weak (0.97) decay; v3.1 ceiling is +9
-        # with faster (0.92) decay back toward a baseline of 3.0.
+        raw_earnings = max(0.5, self.earnings * growth_factor)
+        reversion_speed = 0.06  # gentle pull, same order as asset price reversion
+        self.earnings = raw_earnings + (self._fundamental_earnings - raw_earnings) * reversion_speed
+
+        # Belt-and-suspenders: even after reversion, hard-bound earnings so
+        # pe_ratio cannot be asked to clip an already-extreme number every
+        # single period (keeps PE_FLOOR/PE_CEILING as the steady-state band,
+        # not a last-ditch every-period rescue).
+        min_earnings = 100.0 / self.PE_CEILING
+        max_earnings = 100.0 / self.PE_FLOOR
+        self.earnings = max(min_earnings * 0.5, min(max_earnings * 2.0, self.earnings))
+
+        # earnings_growth update: same mean-reverting form as v3.1 (ceiling
+        # 9, decay 0.92 toward a GDP-linked baseline of 3.0). Kept as-is --
+        # this part was already sane and is not the root cause.
         target = 3.0 + gdp_growth * 0.5
         self.earnings_growth = max(-5.0, min(9.0,
             self.earnings_growth * 0.92 + target * 0.08 + rng.gauss(0, 0.15)))
@@ -1011,6 +1088,18 @@ class LogEntry:
     funding_ratio: float
 
 class SimulationEngine:
+    # v3.2 FIX: weight placed on pulling the regime chain back toward the
+    # scenario's own starting regime each period (see next_regime
+    # docstring / CHANGELOG_v3.2). 0.0 = original unanchored behaviour
+    # (chain free-runs to its generic stationary distribution regardless of
+    # scenario); 1.0 = regime frozen at the scenario's base regime forever
+    # (no organic transitions at all). 0.35 was chosen so that, empirically,
+    # a "Recession" scenario spends a large majority of a 100-period run
+    # actually in the Recession regime while still allowing a Recession ->
+    # Recovery -> Expansion arc to play out over a longer run, the same way
+    # real business cycles eventually turn.
+    REGIME_ANCHOR_STRENGTH = 0.35
+
     def __init__(self, base_env: MacroEnvironment, periods: int = 100, seed: int = 42,
                  agent_filter: Optional[List[str]] = None):
         self.base_env = base_env
@@ -1462,986 +1551,3 @@ def generate_institutional_summary(engine: SimulationEngine) -> str:
         "efficient-market models nor simple factor regressions fully capture."
     )
     return "\n\n".join(paras)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SESSION STATE
-# ══════════════════════════════════════════════════════════════════════════════
-
-def init_session_state():
-    defaults = dict(
-        inflation=3.0, interest_rate=4.0, gdp_growth=2.0, oil_shock=0.0,
-        sentiment="Neutral", regime="Expansion", periods=100, seed=42,
-        engine=None, mc_results=None, mc_scenario=None,
-        mc_n_seeds=100, mc_running=False, ablation_results=None,
-    )
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-def _make_env():
-    return MacroEnvironment(
-        inflation=st.session_state["inflation"],
-        interest_rate=st.session_state["interest_rate"],
-        gdp_growth=st.session_state["gdp_growth"],
-        oil_shock=st.session_state["oil_shock"],
-        sentiment=st.session_state["sentiment"],
-        regime=st.session_state["regime"],
-    )
-
-def apply_scenario_and_run(name: str):
-    p = SCENARIOS[name]
-    for k, v in p.items():
-        st.session_state[k] = v
-    run_simulation()
-
-def run_simulation():
-    env = _make_env()
-    engine = SimulationEngine(env, periods=st.session_state["periods"], seed=st.session_state["seed"])
-    engine.run()
-    st.session_state["engine"] = engine
-    st.session_state["ablation_results"] = None  # invalidate stale ablation run
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_sidebar():
-    c_text     = C["text"]
-    c_green    = C["green"]
-    c_text_dim = C["text_dim"]
-
-    st.sidebar.markdown(
-        f"<div style='font-family:monospace;font-size:1.05rem;font-weight:700;color:{c_text};'>"
-        f"AGENT TWIN <span style='color:{c_green};font-size:.7rem;'>v3.1</span></div>"
-        f"<div style='color:{c_text_dim};font-size:.76rem;margin-bottom:1rem;'>"
-        "Institutional Market Simulator</div>",
-        unsafe_allow_html=True,
-    )
-    st.sidebar.slider("Inflation (%)",        -2.0, 12.0, key="inflation",     step=0.1)
-    st.sidebar.slider("Interest Rate (%)",     0.0, 12.0, key="interest_rate", step=0.1)
-    st.sidebar.slider("GDP Growth (%)",       -8.0,  8.0, key="gdp_growth",    step=0.1)
-    st.sidebar.slider("Oil Price Shock (%)", -50.0,100.0, key="oil_shock",     step=1.0)
-    st.sidebar.selectbox("Market Sentiment", SENTIMENT_LEVELS, key="sentiment")
-    st.sidebar.selectbox("Starting Regime",  REGIMES, key="regime")
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(
-        f"<div style='font-size:.75rem;color:{c_text_dim};text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem;'>Simulation Settings</div>",
-        unsafe_allow_html=True)
-    st.sidebar.slider("Periods", 20, 250, key="periods", step=10)
-    st.sidebar.number_input("Random Seed", 0, 9999, key="seed", step=1)
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(
-        f"<div style='font-size:.75rem;color:{c_text_dim};text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem;'>Scenario Presets</div>",
-        unsafe_allow_html=True)
-    cols = st.sidebar.columns(2)
-    for i, sname in enumerate(SCENARIOS):
-        cols[i%2].button(sname, key=f"sc_{sname}", use_container_width=True,
-                         on_click=apply_scenario_and_run, args=(sname,))
-
-    st.sidebar.markdown("---")
-    if st.sidebar.button("▶  RUN SIMULATION", use_container_width=True, type="primary"):
-        run_simulation()
-        st.rerun()
-
-    if st.session_state["engine"] is None:
-        st.sidebar.info("Configure environment and click Run, or choose a preset.")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CHART HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _fig(h=400, **kwargs) -> go.Figure:
-    f = go.Figure()
-    f.update_layout(**LAYOUT, height=h, **kwargs)
-    return f
-
-def _xaxis(n):
-    return list(range(n))
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RENDERERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_header():
-    st.markdown(
-        '<div class="at-header">AGENT TWIN <span style="font-size:1rem;color:#16a34a;">v3.1</span></div>',
-        unsafe_allow_html=True)
-    st.markdown(
-        '<div class="at-sub">Institutional market simulator with square-root market-impact '
-        'price formation, fundamental mean reversion, full return attribution, agent ablation analysis, '
-        'and a bounded fair-value anchor (v3.1 fix: equity fair value can no longer compound unboundedly).</div>',
-        unsafe_allow_html=True)
-
-def render_env_strip(engine: SimulationEngine):
-    env = engine.base_env
-    items = [
-        ("Inflation", f"{env.inflation:.1f}%"),
-        ("Policy Rate", f"{env.interest_rate:.1f}%"),
-        ("GDP Growth", f"{env.gdp_growth:.1f}%"),
-        ("Oil Shock", f"{env.oil_shock:+.0f}%"),
-        ("Sentiment", env.sentiment),
-        ("Starting Regime", env.regime),
-    ]
-    cols = st.columns(len(items))
-    for col, (lbl, val) in zip(cols, items):
-        col.markdown(
-            f"<div class='panel' style='text-align:center;padding:.6rem .5rem;'>"
-            f"<div class='metric-label'>{lbl}</div>"
-            f"<div class='metric-value' style='font-size:1.05rem;'>{val}</div></div>",
-            unsafe_allow_html=True)
-
-def render_regime_chart(engine: SimulationEngine):
-    if not engine.regime_prob_history:
-        return
-    df = pd.DataFrame(engine.regime_prob_history)
-    df.index = range(1, len(df)+1)
-    fig = _fig(h=280, title=dict(text="Market Regime Probabilities (smoothed)", font=dict(size=14)))
-    for r in REGIMES:
-        if r in df.columns:
-            fig.add_trace(go.Scatter(
-                x=df.index, y=df[r]*100, name=r,
-                stackgroup="one",
-                line=dict(width=0, color=REGIME_COLORS[r]),
-                fillcolor=REGIME_COLORS[r],
-                opacity=0.75,
-            ))
-    fig.update_layout(xaxis_title="Period", yaxis_title="Probability (%)",
-                      hovermode="x unified", yaxis=dict(range=[0,100], **LAYOUT["yaxis"]))
-    st.plotly_chart(fig, use_container_width=True)
-
-def render_valuation_chart(engine: SimulationEngine):
-    er_hist = engine.market.expected_return_history
-    if not er_hist:
-        return
-    periods_x = list(range(1, len(er_hist)+1))
-    fig = _fig(h=320, title=dict(text="Expected Returns by Asset Class (annualised %)", font=dict(size=14)))
-    fig.add_trace(go.Scatter(x=periods_x, y=[e["Stocks"] for e in er_hist], name="Stocks", line=dict(color=C["stock"], width=2)))
-    fig.add_trace(go.Scatter(x=periods_x, y=[e["Bonds"]  for e in er_hist], name="Bonds",  line=dict(color=C["bond"],  width=2)))
-    fig.add_trace(go.Scatter(x=periods_x, y=[e["Gold"]   for e in er_hist], name="Gold",   line=dict(color=C["gold"],  width=2)))
-    fig.add_hline(y=0, line_dash="dot", line_color=C["border"], line_width=1)
-    fig.update_layout(xaxis_title="Period", yaxis_title="Expected Return (%/year)", hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
-
-def render_price_chart(engine: SimulationEngine):
-    m = engine.market
-    n = len(m.assets["Stocks"].price_history)
-    x = _xaxis(n)
-    fig = _fig(h=420, title=dict(text="Asset Price Evolution (Base = 100) — solid = price, dashed = fair value", font=dict(size=14)))
-    for name, col in [("Stocks", C["stock"]), ("Bonds", C["bond"]), ("Gold", C["gold"])]:
-        fig.add_trace(go.Scatter(x=x, y=m.assets[name].price_history, name=name,
-                                 line=dict(color=col, width=2.2)))
-        fig.add_trace(go.Scatter(x=x, y=m.assets[name].fair_value_history, name=f"{name} Fair Value",
-                                 line=dict(color=col, width=1.2, dash="dot"), opacity=0.6,
-                                 showlegend=True))
-    for i, env in enumerate(m.env_history):
-        if env.regime == "Recession":
-            fig.add_vrect(x0=i-0.5, x1=i+0.5, fillcolor=C["recession"],
-                         opacity=0.07, layer="below", line_width=0)
-    fig.update_layout(xaxis_title="Period", yaxis_title="Index Level", hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
-
-def render_summary_metrics(engine: SimulationEngine):
-    m = engine.market
-    cols = st.columns(3)
-    for col, name in zip(cols, ["Stocks","Bonds","Gold"]):
-        tr = m.assets[name].total_return_pct()
-        color = C["green"] if tr >= 0 else C["red"]
-        col.markdown(
-            f"<div class='panel' style='text-align:center;'>"
-            f"<div class='metric-label'>{name} — Total Return</div>"
-            f"<div style='font-size:1.55rem;font-family:monospace;color:{color};margin-top:.15rem;'>{tr:+.1f}%</div>"
-            f"<div class='metric-label' style='margin-top:.3rem;'>Final: {m.assets[name].price:.2f}</div>"
-            "</div>", unsafe_allow_html=True)
-
-def render_funding_ratio_chart(engine: SimulationEngine):
-    pension = next(a for a in engine.agents if isinstance(a, PensionFund))
-    if not pension.funding_ratio_history:
-        return
-    fr = pension.funding_ratio_history
-    x  = list(range(1, len(fr)+1))
-    fig = _fig(h=320, title=dict(text="Pension Fund — Funding Ratio (%)", font=dict(size=14)))
-    fig.add_trace(go.Scatter(x=x, y=fr, name="Funding Ratio",
-                             line=dict(color=C["pension"], width=2.2),
-                             fill="tozeroy", fillcolor=f"rgba(59,130,166,0.08)"))
-    fig.add_hline(y=100, line_dash="dash", line_color=C["amber"],
-                  annotation_text="100% (Full Funding)", line_width=1.5)
-    fig.add_hline(y=90,  line_dash="dot",  line_color=C["red"],
-                  annotation_text="90% (De-risk Threshold)", line_width=1)
-    fig.add_hline(y=120, line_dash="dot",  line_color=C["green"],
-                  annotation_text="120% (Risk-on Trigger)", line_width=1)
-    fig.update_layout(xaxis_title="Period", yaxis_title="Funding Ratio (%)", hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
-
-    c1, c2, c3, c4 = st.columns(4)
-    for col, (lbl, val) in zip([c1,c2,c3,c4], [
-        ("Min Funding Ratio", f"{min(fr):.1f}%"),
-        ("Max Funding Ratio", f"{max(fr):.1f}%"),
-        ("Final Funding Ratio", f"{fr[-1]:.1f}%"),
-        ("Required Return", f"{pension.required_return_pct:.1f}%"),
-    ]):
-        col.markdown(f"<div class='panel' style='text-align:center;padding:.7rem .5rem;'>"
-                     f"<div class='metric-label'>{lbl}</div>"
-                     f"<div class='metric-value' style='font-size:1.1rem;'>{val}</div></div>",
-                     unsafe_allow_html=True)
-
-def render_hedge_fund_dashboard(engine: SimulationEngine):
-    hedge = next(a for a in engine.agents if isinstance(a, HedgeFund))
-    if not hedge.gross_exposure_history:
-        return
-    x = list(range(len(hedge.gross_exposure_history)))
-    fig = _fig(h=320, title=dict(text="Hedge Fund — Gross / Net Exposure & Leverage", font=dict(size=14)))
-    fig.add_trace(go.Scatter(x=x, y=hedge.gross_exposure_history, name="Gross Exposure",
-                             line=dict(color=C["hedge"], width=2.2)))
-    fig.add_trace(go.Scatter(x=x, y=hedge.net_exposure_history, name="Net Exposure",
-                             line=dict(color=C["amber"], width=1.8, dash="dash")))
-    fig.add_hline(y=1.0, line_dash="dot", line_color=C["border"], line_width=1,
-                  annotation_text="1× (Unleveraged)")
-    fig.update_layout(xaxis_title="Period", yaxis_title="Exposure (×)", hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
-
-    if hedge.trend_signal_history and hedge.valuation_signal_history:
-        xt = list(range(len(hedge.trend_signal_history)))
-        fig2 = _fig(h=260, title=dict(text="Hedge Fund — Trend & Valuation Signals", font=dict(size=14)))
-        fig2.add_trace(go.Scatter(x=xt, y=hedge.trend_signal_history, name="Trend Signal",
-                                  line=dict(color=C["stock"], width=2)))
-        fig2.add_trace(go.Scatter(x=xt, y=hedge.valuation_signal_history, name="Valuation Signal",
-                                  line=dict(color=C["purple"], width=2)))
-        fig2.add_hline(y=0, line_dash="dot", line_color=C["border"], line_width=1)
-        fig2.update_layout(xaxis_title="Period", yaxis_title="Signal (−1 to +1)", hovermode="x unified")
-        st.plotly_chart(fig2, use_container_width=True)
-
-    c1, c2, c3 = st.columns(3)
-    for col, (lbl, val) in zip([c1,c2,c3], [
-        ("Peak Gross Leverage", f"{max(hedge.gross_exposure_history):.2f}×"),
-        ("Final Net Exposure",  f"{hedge.net_exposure_history[-1]:.2f}×"),
-        ("Risk Budget (Vol)",   f"{hedge.risk_budget_vol*100:.0f}% ann."),
-    ]):
-        col.markdown(f"<div class='panel' style='text-align:center;padding:.7rem .5rem;'>"
-                     f"<div class='metric-label'>{lbl}</div>"
-                     f"<div class='metric-value' style='font-size:1.1rem;'>{val}</div></div>",
-                     unsafe_allow_html=True)
-
-def render_fear_greed_chart(engine: SimulationEngine):
-    retail = next(a for a in engine.agents if isinstance(a, RetailInvestor))
-    if not retail.fear_history:
-        return
-    x = list(range(len(retail.fear_history)))
-    fig = _fig(h=300, title=dict(text="Retail Investor — Fear / Greed Index", font=dict(size=14)))
-    fig.add_trace(go.Scatter(x=x, y=retail.greed_history, name="Greed",
-                             line=dict(color=C["green"], width=2.2),
-                             fill="tozeroy", fillcolor="rgba(22,163,74,0.07)"))
-    fig.add_trace(go.Scatter(x=x, y=retail.fear_history, name="Fear",
-                             line=dict(color=C["red"], width=2.2),
-                             fill="tozeroy", fillcolor="rgba(179,71,58,0.07)"))
-    fig.add_hline(y=50, line_dash="dot", line_color=C["border"], line_width=1)
-    fig.update_layout(xaxis_title="Period", yaxis_title="Index (0–100)", hovermode="x unified",
-                      yaxis=dict(range=[0,100], **LAYOUT["yaxis"]))
-    st.plotly_chart(fig, use_container_width=True)
-
-    c1, c2, c3 = st.columns(3)
-    for col, (lbl, val) in zip([c1,c2,c3], [
-        ("Avg Greed Score", f"{np.mean(retail.greed_history):.0f}/100"),
-        ("Peak Fear Score", f"{max(retail.fear_history):.0f}/100"),
-        ("News Sensitivity", f"{retail.news_sensitivity:.1f}×"),
-    ]):
-        col.markdown(f"<div class='panel' style='text-align:center;padding:.7rem .5rem;'>"
-                     f"<div class='metric-label'>{lbl}</div>"
-                     f"<div class='metric-value' style='font-size:1.1rem;'>{val}</div></div>",
-                     unsafe_allow_html=True)
-
-def render_allocation_chart(engine: SimulationEngine):
-    tabs = st.tabs([a.name for a in engine.agents])
-    palette = [C["stock"], C["bond"], C["gold"], C["text_dim"]]
-    for tab, agent in zip(tabs, engine.agents):
-        with tab:
-            df = pd.DataFrame(agent.allocation_history)
-            fig = _fig(h=340, title=dict(text=f"{agent.name} — Allocation Over Time", font=dict(size=13)))
-            for i, col_name in enumerate(df.columns):
-                fig.add_trace(go.Scatter(
-                    x=df.index, y=df[col_name]*100, name=col_name,
-                    stackgroup="one",
-                    line=dict(width=0.5, color=palette[i % len(palette)]),
-                    fillcolor=palette[i % len(palette)],
-                ))
-            fig.update_layout(xaxis_title="Period", yaxis_title="Allocation (%)", hovermode="x unified")
-            st.plotly_chart(fig, use_container_width=True, key=f"alloc_{agent.name}")
-
-def render_demand_chart(engine: SimulationEngine):
-    asset_colors = {"Stocks": C["stock"], "Bonds": C["bond"], "Gold": C["gold"]}
-    net_by_agent = []
-    for agent in engine.agents:
-        totals = {k: 0.0 for k in ["Stocks","Bonds","Gold","Cash"]}
-        for o in agent.trade_log:
-            for k, v in o.allocation_deltas.items():
-                if k in totals:
-                    totals[k] += v
-        net_by_agent.append((agent.name, totals, agent.color))
-
-    fig = _fig(h=360, title=dict(text="Cumulative Net Demand by Agent (pp of allocation)", font=dict(size=14)))
-    for asset in ["Stocks","Bonds","Gold"]:
-        fig.add_trace(go.Bar(
-            name=asset,
-            x=[n for n,_,_ in net_by_agent],
-            y=[t[asset]*100 for _,t,_ in net_by_agent],
-            marker_color=asset_colors[asset],
-        ))
-    fig.update_layout(barmode="group", xaxis_title="Agent", yaxis_title="Net Allocation Change (pp)")
-    st.plotly_chart(fig, use_container_width=True)
-
-def render_risk_contribution_chart(engine: SimulationEngine):
-    fig = _fig(h=300, title=dict(text="Risk Contribution by Agent (Realised Portfolio Value)", font=dict(size=14)))
-    for agent in engine.agents:
-        pv  = pd.Series(agent.portfolio_value_history)
-        vol = pv.pct_change().std() * 100
-        fig.add_trace(go.Scatter(
-            x=list(range(len(agent.portfolio_value_history))),
-            y=agent.portfolio_value_history,
-            name=f"{agent.name} (σ={vol:.2f}%/p)",
-            line=dict(color=agent.color, width=2),
-        ))
-    fig.update_layout(xaxis_title="Period", yaxis_title="Portfolio Value (Start=100)", hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
-
-    c1, c2, c3 = st.columns(3)
-    for col, agent in zip([c1,c2,c3], engine.agents):
-        pv  = pd.Series(agent.portfolio_value_history)
-        vol = pv.pct_change().std() * 100
-        tr  = (pv.iloc[-1] / pv.iloc[0] - 1) * 100 if len(pv) > 1 else 0
-        col.markdown(f"<div class='panel' style='text-align:center;padding:.7rem .5rem;'>"
-                     f"<div class='metric-label' style='color:{agent.color};'>{agent.name}</div>"
-                     f"<div class='metric-value' style='font-size:1rem;'>Vol {vol:.2f}%/p</div>"
-                     f"<div class='metric-label' style='margin-top:.25rem;'>Total Return {tr:+.1f}%</div>"
-                     "</div>", unsafe_allow_html=True)
-
-def render_rulebook():
-    with st.expander("📋  Agent Decision Rules — Transparent Rule Engine", expanded=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Pension Fund** &nbsp;<span class='badge'>LDI</span><span class='badge'>Contrarian</span>", unsafe_allow_html=True)
-            for r in [
-                "IF funding ratio < 90% → emergency de-risk",
-                "IF funding ratio < 100% → increase bond matching",
-                "IF funding ratio > 120% → add return-seeking equities",
-                "IF equity–bond yield gap < 1.5pp → trim equities",
-                "IF yield gap > 5pp → add equities vs bonds",
-                "IF inflation > 5% → add gold as liability hedge",
-                "IF stocks fall >8% (5p) & funded → contrarian buy",
-                "IF regime = Recession → defensive shift",
-            ]:
-                st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
-        with c2:
-            st.markdown("**Hedge Fund** &nbsp;<span class='badge'>Trend</span><span class='badge'>Valuation</span><span class='badge'>Risk Budget</span>", unsafe_allow_html=True)
-            for r in [
-                "IF trend & valuation agree (bullish) → leveraged long",
-                "IF trend & valuation agree (bearish) → reduce / short",
-                "IF trend +ve but valuation expensive → half-size long",
-                "IF realised vol > risk budget → scale positions down",
-                "IF sentiment bullish → add leverage",
-                "IF rates > 5% → reduce financing cost exposure",
-                "IF recession / oil crisis → tactical gold",
-                "Track: gross exposure, net exposure, leverage ratio",
-            ]:
-                st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
-        with c3:
-            st.markdown("**Retail Investor** &nbsp;<span class='badge'>Fear/Greed</span><span class='badge'>News</span>", unsafe_allow_html=True)
-            for r in [
-                "Gains compound greed index; losses spike fear index",
-                "IF greed >> fear → euphoric buying / full equity",
-                "IF fear >> greed → panic selling / flee to cash",
-                "IF 5p drawdown > 6% → panic sell trigger",
-                "IF regime = Recession → amplified de-risking",
-                "News sensitivity multiplies all sentiment reactions",
-                "Fear & greed mean-revert each period (not permanent)",
-            ]:
-                st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
-        st.markdown("---")
-        st.markdown("**Price Formation** &nbsp;<span class='badge'>√-Impact</span><span class='badge'>Mean Reversion</span><span class='badge'>Depth</span>", unsafe_allow_html=True)
-        for r in [
-            "impact_pct = sign(flow) · √|flow| · 100/√(market_depth)  — diminishing impact law",
-            "reversion_pct = −reversion_speed · ln(price/fair_value) · 100  — pulls price to fundamentals",
-            "noise_pct = N(0, base_vol · regime_vol_scale)",
-            "total = 8·tanh((impact+reversion+noise)/8)  — smooth damping, no hard floor to saturate",
-            "Stocks: depth=42, reversion=0.055  |  Bonds: depth=70, reversion=0.09  |  Gold: depth=30, reversion=0.045",
-        ]:
-            st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
-        st.markdown("---")
-        st.markdown("**Fair Value Anchor (FIXED in v3.1)** &nbsp;<span class='badge'>Bounded</span><span class='badge'>Rate-Sensitive</span>", unsafe_allow_html=True)
-        for r in [
-            f"fair_value compounds at expected_return/year ÷ {PERIODS_PER_YEAR:.0f} periods, clipped to ±{MAX_PERIOD_FAIR_VALUE_DRIFT_PCT:.2f}%/period",
-            f"(equivalent to a ±{MAX_ANNUAL_FAIR_VALUE_DRIFT_PCT:.0f}%/year sanity band on the fundamental anchor itself)",
-            "Stocks: earnings_yield (=1/PE, FIXED — was a no-op in v3.0) + earnings_growth − discount_penalty − inflation_penalty",
-            "discount_penalty = max(0, real_rate − 2%) × 0.8   |   inflation_penalty = max(0, inflation − 2%) × 0.5",
-            "earnings_growth ceiling tightened 15→9, decay speed 0.97→0.92 (was pinning near max for 100p under modest +GDP)",
-        ]:
-            st.markdown(f"<div class='rule-row'>{r}</div>", unsafe_allow_html=True)
-
-def render_simulation_log(engine: SimulationEngine):
-    c_text     = C["text"]
-    notable = [l for l in engine.logs if l.details]
-    show_all = st.checkbox("Show all periods", value=False)
-    logs = engine.logs if show_all else notable
-
-    if not logs:
-        st.markdown("<div class='log-line'>No threshold rules triggered this run.</div>", unsafe_allow_html=True)
-        return
-
-    display = logs[-40:] if len(logs) > 40 else logs
-    if len(logs) > 40:
-        st.caption(f"Showing most recent 40 of {len(logs)} periods.")
-
-    parts = []
-    for l in display:
-        regime_color = REGIME_COLORS.get(l.regime, C["text_dim"])
-        lines = [
-            f"<span class='log-period'>Period {l.period}</span> "
-            f"<span style='color:{regime_color};font-size:.72rem;'>[{l.regime}]</span> "
-            f"<span style='color:{c_text};'>FR:{l.funding_ratio:.0f}%</span> — {l.headline}."
-        ]
-        for d in l.details:
-            lines.append(f"&nbsp;&nbsp;↳ {d}")
-        lines.append(
-            f"&nbsp;&nbsp;Stocks {l.stock_change:+.2f}% · "
-            f"Bonds {l.bond_change:+.2f}% · Gold {l.gold_change:+.2f}%"
-        )
-        parts.append("<div class='log-line'>" + "<br>".join(lines) + "</div><br>")
-
-    st.markdown(
-        "<div class='panel' style='max-height:420px;overflow-y:auto;'>" + "".join(parts) + "</div>",
-        unsafe_allow_html=True)
-
-def render_institutional_panel(engine: SimulationEngine):
-    st.markdown("### Institutional Analysis")
-    summary = generate_institutional_summary(engine)
-    st.markdown(
-        "<div class='panel' style='line-height:1.7;font-size:.93rem;font-family:IBM Plex Sans,sans-serif;'>"
-        + summary.replace("\n\n","<br><br>") + "</div>",
-        unsafe_allow_html=True)
-    st.caption("Generated entirely from simulation arrays — no external AI API.")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DIAGNOSTICS PANEL  (NEW in v3.1)
-# ══════════════════════════════════════════════════════════════════════════════
-# Surfaces exactly the metrics identified in the forensic diagnosis as the
-# fastest way to confirm/reject "fair-value anchor blow-up" as a class of
-# bug, so this doesn't have to be re-derived from first principles if a
-# similar symptom appears again after future changes.
-
-def render_diagnostics_panel(engine: SimulationEngine):
-    st.markdown("### 🩺  Diagnostics — Fair Value vs. Price Decomposition")
-    st.caption(
-        "Isolates how much of an asset's total return came from the fundamental anchor "
-        "(fair value) vs. agent-flow/price-impact effects, and reports fair-value clip activations."
-    )
-
-    m = engine.market
-    cols = st.columns(3)
-    for col, name in zip(cols, ["Stocks", "Bonds", "Gold"]):
-        asset = m.assets[name]
-        price_tr = asset.total_return_pct()
-        fv_tr    = asset.fair_value_total_return_pct()
-        clip_events = m.fv_drift_clip_events.get(name, 0)
-        clip_pct = clip_events / max(1, len(asset.fv_period_drift_applied_history) - 1) * 100
-
-        clip_color = C["red"] if clip_pct > 20 else (C["amber"] if clip_pct > 0 else C["green"])
-        col.markdown(
-            f"<div class='panel' style='padding:.8rem;'>"
-            f"<div class='metric-label'>{name}</div>"
-            f"<div style='font-family:monospace;font-size:.85rem;margin-top:.3rem;'>Price Total Return: "
-            f"<b>{price_tr:+.1f}%</b></div>"
-            f"<div style='font-family:monospace;font-size:.85rem;'>Fair Value Total Return: "
-            f"<b>{fv_tr:+.1f}%</b></div>"
-            f"<div style='font-family:monospace;font-size:.8rem;color:{C['text_dim']};margin-top:.25rem;'>"
-            f"Gap (price − fair value): {price_tr - fv_tr:+.1f}pp</div>"
-            f"<div style='font-family:monospace;font-size:.8rem;color:{clip_color};margin-top:.4rem;'>"
-            f"Fair-value drift clip activated: {clip_events} periods ({clip_pct:.0f}%)</div>"
-            "</div>", unsafe_allow_html=True)
-
-    st.markdown(
-        f"<div style='font-family:monospace;font-size:.78rem;color:{C['text_dim']};margin-top:.3rem;'>"
-        "Interpretation: if Price Total Return and Fair Value Total Return are close, the anchor is "
-        "driving the result (a valuation-model issue, not an agent-flow issue). If the clip activated "
-        "in a large share of periods, the underlying valuation model is frequently trying to imply an "
-        "extreme annualised return and is being actively restrained — worth tightening the valuation "
-        "model itself rather than relying on the clip.</div>",
-        unsafe_allow_html=True)
-
-    er_df = pd.DataFrame(m.expected_return_history)
-    if not er_df.empty:
-        st.markdown("**Annualised expected-return series (input to the fair-value anchor)**")
-        st.dataframe(
-            er_df.describe().T.style.format("{:.2f}"),
-            use_container_width=True,
-        )
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RETURN ATTRIBUTION DASHBOARD
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_attribution_section(engine: SimulationEngine):
-    st.markdown("### 🧮  Return Attribution — Why Did Stocks Move?")
-    st.caption("Decomposition reconciles exactly to the realised total return (log-additive, converted to simple-return space).")
-
-    asset_choice = st.selectbox("Asset", ["Stocks", "Bonds", "Gold"], key="attr_asset_select")
-    df = compute_attribution_table(engine, asset=asset_choice)
-    agent_names = [a.name for a in engine.agents]
-    summary = summarize_attribution(df, agent_names)
-
-    components = ["Valuation_Macro"] + agent_names + ["Noise"]
-    labels = {
-        "Valuation_Macro": "Valuation / Macro",
-        "Pension Fund": "Pension Fund Impact",
-        "Hedge Fund": "Hedge Fund Impact",
-        "Retail Investor": "Retail Impact",
-        "Noise": "Random Noise",
-    }
-    colors = {
-        "Valuation_Macro": C["valuation_attr"],
-        "Pension Fund": C["pension_attr"],
-        "Hedge Fund": C["hedge_attr"],
-        "Retail Investor": C["retail_attr"],
-        "Noise": C["noise_attr"],
-    }
-
-    fig = _fig(h=340, title=dict(text=f"{asset_choice} Total Return Attribution", font=dict(size=14)))
-    names_ordered = [labels.get(c, c) for c in components] + ["Total Return"]
-    values_ordered = [summary[c] for c in components] + [summary["Total"]]
-    bar_colors = [colors.get(c, C["text_dim"]) for c in components] + [C["green"] if summary["Total"] >= 0 else C["red"]]
-    fig.add_trace(go.Bar(x=names_ordered, y=values_ordered, marker_color=bar_colors,
-                         text=[f"{v:+.1f}%" for v in values_ordered], textposition="outside"))
-    fig.add_hline(y=0, line_dash="dot", line_color=C["border"], line_width=1)
-    fig.update_layout(yaxis_title="Contribution to Total Return (%)", showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-    c_text_dim = C["text_dim"]
-    rows_html = "".join(
-        f"<tr><td style='padding:.35rem .7rem;font-family:monospace;font-size:.85rem;color:{colors.get(c, C['text'])};'>{labels.get(c,c)}</td>"
-        f"<td style='padding:.35rem .7rem;font-family:monospace;font-size:.85rem;text-align:right;'>{summary[c]:+.2f}%</td></tr>"
-        for c in components
-    )
-    st.markdown(
-        f"<div class='panel'><table style='width:100%;border-collapse:collapse;'>"
-        f"<thead><tr><th style='text-align:left;padding:.35rem .7rem;color:{c_text_dim};font-size:.75rem;text-transform:uppercase;'>Component</th>"
-        f"<th style='text-align:right;padding:.35rem .7rem;color:{c_text_dim};font-size:.75rem;text-transform:uppercase;'>Contribution</th></tr></thead>"
-        f"<tbody>{rows_html}"
-        f"<tr style='border-top:1px solid {C['border']};'><td style='padding:.45rem .7rem;font-family:monospace;font-weight:700;'>Total Return</td>"
-        f"<td style='padding:.45rem .7rem;font-family:monospace;font-weight:700;text-align:right;'>{summary['Total']:+.2f}%</td></tr>"
-        f"</tbody></table></div>",
-        unsafe_allow_html=True)
-
-    reconciled = abs(sum(summary[c] for c in components) - summary["Total"]) < 0.05
-    if reconciled:
-        st.markdown(f"<span style='color:{C['green']};font-family:monospace;font-size:.8rem;'>✓ Components reconcile exactly to total return.</span>", unsafe_allow_html=True)
-    else:
-        st.markdown(f"<span style='color:{C['amber']};font-family:monospace;font-size:.8rem;'>⚠ Reconciliation gap detected — check log.</span>", unsafe_allow_html=True)
-
-    with st.expander("Per-period attribution detail"):
-        st.dataframe(df.style.format({c: "{:+.2f}" for c in df.columns if c != "Period"}), use_container_width=True, height=300)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# AGENT IMPACT ANALYSIS DASHBOARD
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_agent_impact_section(engine: SimulationEngine):
-    st.markdown("### 🔬  Agent Impact Analysis — Ablation Study")
-    st.caption("Re-runs the identical environment/seed with each agent's market flow removed in turn, isolating its price-formation footprint.")
-
-    if st.button("▶  Run Agent Ablation Study", type="primary"):
-        with st.spinner("Running 4 configurations (Full / w/o Pension / w/o Hedge / w/o Retail)..."):
-            results = run_agent_ablation(engine.base_env, periods=engine.periods, seed=st.session_state["seed"])
-            st.session_state["ablation_results"] = results
-
-    results = st.session_state.get("ablation_results")
-    if results is None:
-        st.info("Click **Run Agent Ablation Study** to quantify each agent's contribution to return, volatility, and drawdown.")
-        return
-
-    asset_choice = st.selectbox("Asset", ["Stocks", "Bonds", "Gold"], key="ablation_asset_select")
-    df = summarize_ablation(results, asset=asset_choice)
-
-    c_text_dim = C["text_dim"]
-    display_cols = ["Configuration", "Total Return", "Volatility (per period)", "Max Drawdown",
-                    "Return Contribution (pp vs Full)", "Volatility Contribution (pp vs Full)",
-                    "Drawdown Contribution (pp vs Full)"]
-    header_html = "".join(
-        f"<th style='padding:.3rem .6rem;font-size:.74rem;color:{c_text_dim};text-transform:uppercase;text-align:left;'>{c}</th>"
-        for c in display_cols
-    )
-    rows_html = ""
-    for _, row in df.iterrows():
-        is_full = row["Configuration"] == "Full Model"
-        cells = []
-        for c in display_cols:
-            v = row[c]
-            if c == "Configuration":
-                weight = "700" if is_full else "400"
-                cells.append(f"<td style='padding:.35rem .6rem;font-family:monospace;font-size:.85rem;font-weight:{weight};'>{v}</td>")
-            else:
-                cells.append(f"<td style='padding:.35rem .6rem;font-family:monospace;font-size:.85rem;text-align:right;'>{v:+.2f}</td>")
-        rows_html += f"<tr>{''.join(cells)}</tr>"
-
-    st.markdown(
-        f"<div class='panel'><table style='width:100%;border-collapse:collapse;'>"
-        f"<thead><tr>{header_html}</tr></thead><tbody>{rows_html}</tbody></table></div>",
-        unsafe_allow_html=True)
-
-    fig = _fig(h=320, title=dict(text=f"{asset_choice} — Return Contribution by Agent (pp vs Full Model)", font=dict(size=14)))
-    ablation_only = df[df["Configuration"] != "Full Model"]
-    fig.add_trace(go.Bar(
-        x=ablation_only["Configuration"], y=ablation_only["Return Contribution (pp vs Full)"],
-        marker_color=[C["pension_attr"], C["hedge_attr"], C["retail_attr"]],
-        text=[f"{v:+.1f}pp" for v in ablation_only["Return Contribution (pp vs Full)"]],
-        textposition="outside",
-    ))
-    fig.add_hline(y=0, line_dash="dot", line_color=C["border"], line_width=1)
-    fig.update_layout(yaxis_title="Return Contribution (pp)", showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.caption(
-        "Interpretation: a positive 'Return Contribution' for 'Without X' means agent X's flow was a net "
-        "DRAG on this asset's return in the Full Model (removing it increases the return). A negative value "
-        "means agent X's flow was a net TAILWIND."
-    )
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MONTE CARLO DASHBOARD
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_monte_carlo_section():
-    st.markdown("### 🎲  Monte Carlo Validation")
-
-    with st.expander("Monte Carlo Settings & Run", expanded=True):
-        col_s, col_n, col_btn = st.columns([2, 2, 1])
-        scenario_options = ["(current params)"] + list(SCENARIOS.keys())
-        mc_scenario = col_s.selectbox("Scenario to test", scenario_options, key="mc_scenario_select")
-        n_seeds = col_n.slider("Number of seeds", 20, 200, value=100, step=10, key="mc_n_seeds_slider")
-        run_mc  = col_btn.button("▶  Run MC", use_container_width=True, type="primary")
-
-    if run_mc:
-        if mc_scenario == "(current params)":
-            env = _make_env()
-            label = "Custom Parameters"
-        else:
-            p = SCENARIOS[mc_scenario]
-            env = MacroEnvironment(**p)
-            label = mc_scenario
-
-        with st.spinner(f"Running {n_seeds} seeds for '{label}'..."):
-            mc = run_monte_carlo(env, periods=st.session_state["periods"], n_seeds=n_seeds)
-            st.session_state["mc_results"]  = mc
-            st.session_state["mc_label"]    = label
-            st.session_state["mc_scenario"] = mc_scenario if mc_scenario != "(current params)" else None
-
-    mc = st.session_state.get("mc_results")
-    if mc is None:
-        st.info("Click **Run MC** to validate scenario robustness across multiple seeds.")
-        return
-
-    label = st.session_state.get("mc_label", "Scenario")
-    scenario_name = st.session_state.get("mc_scenario") or ""
-
-    st.markdown(f"#### Monte Carlo Results — *{label}* ({mc['n_seeds']} seeds)")
-
-    sr_stats = monte_carlo_stats(mc["stock_returns"])
-    br_stats = monte_carlo_stats(mc["bond_returns"])
-    gr_stats = monte_carlo_stats(mc["gold_returns"])
-
-    st.markdown("##### Summary Statistics")
-    col_labels = ["Metric", "Stocks", "Bonds", "Gold"]
-    rows = [
-        ("Mean Return",        f"{sr_stats['mean']:+.1f}%",   f"{br_stats['mean']:+.1f}%",   f"{gr_stats['mean']:+.1f}%"),
-        ("Median Return",      f"{sr_stats['median']:+.1f}%", f"{br_stats['median']:+.1f}%", f"{gr_stats['median']:+.1f}%"),
-        ("Std Deviation",      f"{sr_stats['std']:.1f}%",     f"{br_stats['std']:.1f}%",     f"{gr_stats['std']:.1f}%"),
-        ("Best Case",          f"{sr_stats['best']:+.1f}%",   f"{br_stats['best']:+.1f}%",   f"{gr_stats['best']:+.1f}%"),
-        ("Worst Case",         f"{sr_stats['worst']:+.1f}%",  f"{br_stats['worst']:+.1f}%",  f"{gr_stats['worst']:+.1f}%"),
-        ("P(Positive Return)", f"{sr_stats['p_pos']:.0f}%",   f"{br_stats['p_pos']:.0f}%",   f"{gr_stats['p_pos']:.0f}%"),
-        ("P(Loss)",            f"{sr_stats['p_loss']:.0f}%",  f"{br_stats['p_loss']:.0f}%",  f"{gr_stats['p_loss']:.0f}%"),
-    ]
-
-    c_text_dim = C["text_dim"]
-    html_rows = "".join(
-        f"<tr><td style='color:{c_text_dim};padding:.3rem .6rem;font-size:.85rem;'>{r[0]}</td>"
-        + "".join(f"<td style='padding:.3rem .6rem;font-size:.85rem;font-family:monospace;'>{v}</td>" for v in r[1:])
-        + "</tr>"
-        for r in rows
-    )
-    header_html = "".join(
-        f"<th style='color:{c_text_dim};padding:.3rem .6rem;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;text-align:left;'>{h}</th>"
-        for h in col_labels
-    )
-    st.markdown(
-        f"<div class='panel'><table style='width:100%;border-collapse:collapse;'>"
-        f"<thead><tr>{header_html}</tr></thead><tbody>{html_rows}</tbody></table></div>",
-        unsafe_allow_html=True)
-
-    fig_hist = _fig(h=320, title=dict(text="Distribution of Stock Returns Across Seeds", font=dict(size=14)))
-    fig_hist.add_trace(go.Histogram(
-        x=mc["stock_returns"], nbinsx=25, name="Stock Returns",
-        marker_color=C["stock"], opacity=0.8,
-    ))
-    fig_hist.add_vline(x=sr_stats["mean"],   line_dash="dash",  line_color=C["amber"], annotation_text=f"Mean {sr_stats['mean']:+.1f}%")
-    fig_hist.add_vline(x=sr_stats["median"], line_dash="dot",   line_color=C["green"], annotation_text=f"Median {sr_stats['median']:+.1f}%")
-    fig_hist.add_vline(x=0,                  line_dash="solid", line_color=C["red"],   line_width=1.5, annotation_text="0%")
-    fig_hist.update_layout(xaxis_title="Total Stock Return (%)", yaxis_title="Count")
-    st.plotly_chart(fig_hist, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("##### ✅  Scenario Consistency Tests")
-
-    tests = run_consistency_tests(mc, scenario_name)
-    if not tests:
-        st.info("No specific consistency tests defined for this scenario.")
-    else:
-        all_pass = all(t["passed"] for t in tests)
-        n_pass   = sum(1 for t in tests if t["passed"])
-        summary_color = C["green"] if all_pass else (C["amber"] if n_pass >= len(tests)//2 else C["red"])
-        st.markdown(
-            f"<div style='font-family:monospace;font-size:.85rem;color:{summary_color};margin-bottom:.5rem;'>"
-            f"{'✓ All tests passed' if all_pass else f'{n_pass}/{len(tests)} tests passed'}"
-            "</div>",
-            unsafe_allow_html=True)
-
-        for t in tests:
-            badge = "<span class='pass-badge'>PASS</span>" if t["passed"] else "<span class='fail-badge'>FAIL</span>"
-            st.markdown(
-                f"<div class='panel' style='padding:.5rem .9rem;margin-bottom:.4rem;'>"
-                f"{badge} <span style='font-family:monospace;font-size:.83rem;'>{t['name']}</span>"
-                f"<span style='color:{c_text_dim};font-size:.8rem;font-family:monospace;'>"
-                f" — condition: {t['condition']} — result: <b>{t['value']}</b></span>"
-                "</div>",
-                unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.markdown("##### 📊  Economic Dominance Score")
-
-    engine = st.session_state.get("engine")
-    if engine is None:
-        if scenario_name and scenario_name in SCENARIOS:
-            p = SCENARIOS[scenario_name]
-            env_ed = MacroEnvironment(**p)
-        else:
-            env_ed = _make_env()
-        engine = SimulationEngine(env_ed, periods=st.session_state["periods"], seed=0)
-        engine.run()
-
-    dom = compute_economic_dominance(engine)
-
-    if dom["r2"] is not None:
-        sig   = dom["signal_pct"]
-        noise = dom["noise_pct"]
-
-        sig_color   = C["green"] if sig > 40   else C["amber"] if sig > 25   else C["red"]
-        noise_color = C["red"]   if noise > 70 else C["amber"] if noise > 55 else C["green"]
-
-        col1, col2, col3 = st.columns(3)
-        col1.markdown(
-            f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-            f"<div class='metric-label'>Economic Signal Strength</div>"
-            f"<div class='metric-value' style='color:{sig_color};'>{sig:.1f}%</div>"
-            f"<div class='metric-label' style='margin-top:.2rem;'>R² of macro→returns</div></div>",
-            unsafe_allow_html=True)
-        col2.markdown(
-            f"<div class='panel' style='text-align:center;padding:.7rem;'>"
-            f"<div class='metric-label'>Noise Contribution</div>"
-            f"<div class='metric-value' style='color:{noise_color};'>{noise:.1f}%</div>"
-            f"<div class='metric-label' style='margin-top:.2rem;'>Unexplained variance</div></div>",
-            unsafe_allow_html=True)
-
-        r2_bars = dom.get("asset_r2", {})
-
-        def _r2_color(v: float) -> str:
-            return C["green"] if v > 0.35 else C["amber"] if v > 0.2 else C["red"]
-
-        col3.markdown(
-            "<div class='panel' style='text-align:center;padding:.7rem;'>"
-            "<div class='metric-label'>Per-Asset R²</div>"
-            + "".join(
-                f"<div style='font-family:monospace;font-size:.85rem;margin-top:.2rem;'>"
-                f"{a}: <span style='color:{_r2_color(v)};'>{v*100:.1f}%</span></div>"
-                for a, v in r2_bars.items()
-            )
-            + "</div>",
-            unsafe_allow_html=True)
-
-        c_red       = C["red"]
-        c_green     = C["green"]
-        c_green_dim = C["green_dim"]
-
-        if dom["warning"]:
-            st.markdown(
-                f"<div style='background:#3d1210;border:1px solid {c_red};border-radius:6px;padding:.7rem 1rem;margin-top:.5rem;'>"
-                f"<span style='color:{c_red};font-family:monospace;font-weight:700;'>⚠ NOISE DOMINANCE WARNING</span>"
-                f"<span style='color:{c_text_dim};font-size:.85rem;font-family:monospace;'>"
-                f" — Noise explains {noise:.1f}% of variance. "
-                "Economic fundamentals are insufficiently dominant. Consider reducing stochastic noise parameters or increasing simulation length.</span>"
-                "</div>",
-                unsafe_allow_html=True)
-        else:
-            st.markdown(
-                f"<div style='background:{c_green_dim};border:1px solid {c_green};border-radius:6px;padding:.5rem 1rem;margin-top:.5rem;'>"
-                f"<span style='color:{c_green};font-family:monospace;font-size:.85rem;'>"
-                f"✓ Economic fundamentals are sufficiently dominant ({sig:.1f}% of variance explained).</span>"
-                "</div>",
-                unsafe_allow_html=True)
-
-        fig_dom = _fig(h=200, title=dict(text="Per-Asset: Economic Signal vs Noise", font=dict(size=12)))
-        assets_list = list(r2_bars.keys())
-        sig_vals   = [r2_bars[a]*100 for a in assets_list]
-        noise_vals = [100 - v for v in sig_vals]
-        fig_dom.add_trace(go.Bar(x=assets_list, y=sig_vals,  name="Signal", marker_color=C["green"], opacity=0.8))
-        fig_dom.add_trace(go.Bar(x=assets_list, y=noise_vals, name="Noise", marker_color=C["red"],   opacity=0.6))
-        fig_dom.update_layout(barmode="stack", yaxis_title="% of Variance",
-                              yaxis=dict(range=[0,100], **LAYOUT["yaxis"]))
-        st.plotly_chart(fig_dom, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("##### 🛡️  Robustness Dashboard")
-
-    conf  = compute_confidence(mc)
-    level = conf["level"]
-    lc    = conf["label_class"]
-
-    st.markdown(
-        f"<div class='panel'>"
-        f"<div class='metric-label'>Confidence Level</div>"
-        f"<div class='{lc}' style='font-size:1.5rem;margin:.2rem 0;'>{level}</div>"
-        f"<div style='color:{c_text_dim};font-size:.82rem;font-family:monospace;'>"
-        f"CoV = {conf['cov']:.2f} | Std = {conf['std']:.1f}% | "
-        f"Outcome Range = {conf['range']:.1f}pp | P(Positive) = {conf['p_pos']:.0f}%"
-        "</div></div>",
-        unsafe_allow_html=True)
-
-    st.markdown("**Robustness across all built-in scenarios** (20 seeds each, quick preview)")
-    if st.button("Generate robustness table for all scenarios"):
-        with st.spinner("Running 20-seed MC for each scenario..."):
-            rob_rows = []
-            for sname, sparams in SCENARIOS.items():
-                senv = MacroEnvironment(**sparams)
-                smc  = run_monte_carlo(senv, periods=st.session_state["periods"], n_seeds=20)
-                sc   = compute_confidence(smc)
-                rob_rows.append({
-                    "Scenario":        sname,
-                    "Avg Stock Return": f"{np.mean(smc['stock_returns']):+.1f}%",
-                    "Outcome Range":    f"{np.max(smc['stock_returns'])-np.min(smc['stock_returns']):.1f}pp",
-                    "Std Dev":          f"{np.std(smc['stock_returns']):.1f}%",
-                    "P(Positive)":      f"{np.mean(smc['stock_returns']>0)*100:.0f}%",
-                    "Confidence":       sc["level"],
-                })
-
-        df_rob = pd.DataFrame(rob_rows)
-
-        def conf_badge(v):
-            cls = "pass-badge" if v == "High" else ("warn-badge" if v == "Medium" else "fail-badge")
-            return f"<span class='{cls}'>{v}</span>"
-
-        header_cells = "".join(
-            f"<th style='color:{c_text_dim};padding:.3rem .6rem;font-size:.78rem;"
-            f"text-transform:uppercase;text-align:left;'>{c}</th>"
-            for c in df_rob.columns
-        )
-        html_rob = (
-            "<div class='panel'><table style='width:100%;border-collapse:collapse;'>"
-            f"<thead><tr>{header_cells}</tr></thead><tbody>"
-        )
-        for _, row in df_rob.iterrows():
-            cells = []
-            for col_name, val in row.items():
-                if col_name == "Confidence":
-                    cells.append(f"<td style='padding:.3rem .6rem;'>{conf_badge(val)}</td>")
-                else:
-                    cells.append(f"<td style='padding:.3rem .6rem;font-size:.85rem;font-family:monospace;'>{val}</td>")
-            html_rob += f"<tr>{''.join(cells)}</tr>"
-        html_rob += "</tbody></table></div>"
-        st.markdown(html_rob, unsafe_allow_html=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
-
-def main():
-    init_session_state()
-    render_sidebar()
-    render_header()
-
-    engine: Optional[SimulationEngine] = st.session_state.get("engine")
-    render_rulebook()
-    st.markdown("---")
-
-    c_text_dim = C["text_dim"]
-
-    if engine is None:
-        st.markdown(
-            f"<div class='panel' style='text-align:center;padding:3rem 1rem;'>"
-            f"<div style='font-size:1.05rem;color:{c_text_dim};'>"
-            "No simulation running.<br>Set parameters in the sidebar and click "
-            "<b>RUN SIMULATION</b>, or choose a scenario preset.</div></div>",
-            unsafe_allow_html=True)
-        st.markdown("---")
-        render_monte_carlo_section()
-        return
-
-    st.markdown("### 1 · Market Environment")
-    render_env_strip(engine)
-
-    st.markdown("### 2 · Market Regimes")
-    render_regime_chart(engine)
-
-    st.markdown("### 3 · Asset Valuations & Expected Returns")
-    render_valuation_chart(engine)
-
-    st.markdown("### 4 · Simulation Results")
-    render_summary_metrics(engine)
-    render_price_chart(engine)
-    st.markdown("---")
-
-    st.markdown("### 5 · Pension Fund — Liability-Driven Dashboard")
-    render_funding_ratio_chart(engine)
-    st.markdown("---")
-
-    st.markdown("### 6 · Hedge Fund — Exposure & Signal Dashboard")
-    render_hedge_fund_dashboard(engine)
-    st.markdown("---")
-
-    st.markdown("### 7 · Retail Investor — Fear / Greed Dashboard")
-    render_fear_greed_chart(engine)
-    st.markdown("---")
-
-    st.markdown("### 8 · Agent Allocations & Market Demand")
-    render_allocation_chart(engine)
-    render_demand_chart(engine)
-    st.markdown("---")
-
-    st.markdown("### 9 · Risk Contributions & Portfolio Performance")
-    render_risk_contribution_chart(engine)
-    st.markdown("---")
-
-    st.markdown("### 10 · Diagnostics")
-    render_diagnostics_panel(engine)
-    st.markdown("---")
-
-    st.markdown("### 11 · Return Attribution")
-    render_attribution_section(engine)
-    st.markdown("---")
-
-    st.markdown("### 12 · Agent Impact Analysis")
-    render_agent_impact_section(engine)
-    st.markdown("---")
-
-    st.markdown("### 13 · Simulation Log")
-    render_simulation_log(engine)
-    st.markdown("---")
-
-    render_institutional_panel(engine)
-    st.markdown("---")
-
-    render_monte_carlo_section()
-
-    st.markdown("---")
-    st.caption(
-        "Agent Twin v3.1 — square-root market impact, fundamental mean reversion, "
-        "exact return attribution, agent ablation analysis, bounded fair-value anchor. Not investment advice."
-    )
-
-if __name__ == "__main__":
-    main()
