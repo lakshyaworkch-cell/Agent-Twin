@@ -1551,4 +1551,5 @@ def generate_institutional_summary(engine: SimulationEngine) -> str:
         "efficient-market models nor simple factor regressions fully capture."
     )
     return "\n\n".join(paras)
- st.write("App loaded successfully")
+
+st.write("App loaded successfully")
