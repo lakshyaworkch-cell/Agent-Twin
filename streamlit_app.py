@@ -9,23 +9,16 @@
 
   Everything else is auto-extracted from yfinance + live 10Y Treasury.
 
-  Model architecture (sell-side standard):
-    - NOPAT-based FCFF  : EBIT x (1-t) + D&A - CapEx - dNWC
-    - Tax               : 3yr effective tax rate from income statement
-    - Revenue           : Segment-aware growth with analyst fwd estimate
-    - Margin            : Expanding margin path (not flat historical avg)
-    - CapEx             : Split maintenance (~ D&A) + growth CapEx
-    - D&A               : PP&E roll-forward (opening + CapEx - depreciation)
-    - NWC               : Days-based (DSO, DIO, DPO individually trended)
-    - Terminal Value    : Gordon Growth Model, g = live 10Y Treasury yield
-    - Sensitivity       : WACC x terminal growth (11x11 matrix)
-    - Football field    : DCF vs EV/EBITDA vs P/E vs 52-week range
+  Fix applied: Rate-limit handling with retry + browser session headers.
 ================================================================================
 """
 
 import warnings
 warnings.filterwarnings("ignore")
 
+import time
+import random
+import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -41,8 +34,101 @@ pd.set_option("display.float_format", lambda x: f"{x:,.2f}")
 TICKER        = "GOOG"
 WACC          = 0.112        # your cost-of-capital assumption
 
-FORECAST_YEARS = 5          # standard sell-side horizon
+FORECAST_YEARS = 5           # standard sell-side horizon
 # ============================================================
+
+
+# -------------------------------------------------------------
+# RATE-LIMIT SAFE FETCH WRAPPER
+# -------------------------------------------------------------
+
+def make_session():
+    """Create a requests Session that looks like a real browser.
+    This dramatically reduces Yahoo Finance rate-limit rejections."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection":      "keep-alive",
+    })
+    return session
+
+
+def fetch_ticker(symbol, max_retries=5, base_delay=2.0):
+    """Return a yf.Ticker object, retrying on rate-limit errors."""
+    session = make_session()
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            tk = yf.Ticker(symbol, session=session)
+            # Trigger a lightweight call to confirm the session works
+            _ = tk.fast_info
+            return tk
+        except Exception as exc:
+            msg = str(exc).lower()
+            is_rate_limit = any(k in msg for k in
+                                ["rate limit", "429", "too many requests",
+                                 "yfratelimiterror", "encountered an error"])
+            if not is_rate_limit:
+                raise   # non-rate-limit error -> surface immediately
+
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            print(f"  [Rate limit] attempt {attempt}/{max_retries}. "
+                  f"Retrying in {delay:.1f}s ...")
+            time.sleep(delay)
+            last_exc = exc
+
+    raise RuntimeError(
+        f"Still rate-limited after {max_retries} attempts for {symbol}.\n"
+        "  Tips:\n"
+        "    - Wait a few minutes and re-run.\n"
+        "    - Use a VPN or different network.\n"
+        "    - Reduce how often you call this script.\n"
+        f"  Original error: {last_exc}"
+    )
+
+
+def safe_fast_info(tk, key, fallback=None):
+    """Read a key from fast_info with a fallback."""
+    try:
+        return tk.fast_info[key]
+    except Exception:
+        return fallback
+
+
+def fetch_statement(tk, attr, max_retries=5, base_delay=2.0):
+    """Fetch a statement (financials / cashflow / balance_sheet) with retry."""
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            data = getattr(tk, attr)
+            if data is not None and not data.empty:
+                return data
+            return data   # empty but valid
+        except Exception as exc:
+            msg = str(exc).lower()
+            is_rate_limit = any(k in msg for k in
+                                ["rate limit", "429", "too many requests",
+                                 "yfratelimiterror", "encountered an error"])
+            if not is_rate_limit:
+                raise
+
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            print(f"  [Rate limit / {attr}] attempt {attempt}/{max_retries}. "
+                  f"Retrying in {delay:.1f}s ...")
+            time.sleep(delay)
+            last_exc = exc
+
+    raise RuntimeError(
+        f"Could not fetch '{attr}' after {max_retries} retries. "
+        f"Original error: {last_exc}"
+    )
 
 
 # -------------------------------------------------------------
@@ -50,14 +136,12 @@ FORECAST_YEARS = 5          # standard sell-side horizon
 # -------------------------------------------------------------
 
 def get_row(stmt, *keys):
-    """Return first matching row from a financial statement, else None."""
     for k in keys:
         if k in stmt.index:
             return stmt.loc[k]
     return None
 
 def to_b(series_val):
-    """Convert raw yfinance value (in ones) to billions."""
     try:
         return float(series_val) / 1e9
     except Exception:
@@ -70,11 +154,9 @@ def safe_div(a, b, fallback=np.nan):
         return fallback
 
 def trailing_avg(series, n=3):
-    """N-period trailing average, ignoring NaN."""
     return series.dropna().tail(n).mean()
 
 def cagr(series, n):
-    """N-year CAGR from a pandas Series (sorted oldest->newest)."""
     s = series.dropna()
     if len(s) < n + 1:
         n = len(s) - 1
@@ -99,25 +181,30 @@ def print_section(title):
 # -------------------------------------------------------------
 print("\n  Fetching live Risk-Free Rate (^TNX)...")
 try:
-    rfr_raw        = yf.Ticker("^TNX").fast_info["lastPrice"]
-    RISK_FREE_RATE = round(rfr_raw / 100, 4)
+    rfr_tk         = fetch_ticker("^TNX")
+    rfr_raw        = safe_fast_info(rfr_tk, "lastPrice")
+    RISK_FREE_RATE = round(float(rfr_raw) / 100, 4)
     print(f"  10Y Treasury Yield : {RISK_FREE_RATE:.2%}")
-except Exception:
+except Exception as e:
     RISK_FREE_RATE = 0.04
-    print(f"  Fallback RFR used  : {RISK_FREE_RATE:.2%}")
+    print(f"  Could not fetch RFR ({e}). Using fallback: {RISK_FREE_RATE:.2%}")
 
-TERMINAL_GROWTH = RISK_FREE_RATE      # g = RFR  (can't grow > economy forever)
+TERMINAL_GROWTH = RISK_FREE_RATE
 
 
 # -------------------------------------------------------------
 # 2. FETCH ALL RAW DATA
 # -------------------------------------------------------------
-print(f"\n  Fetching financial data for {TICKER}...")
-tk          = yf.Ticker(TICKER)
-info        = tk.info
-financials  = tk.financials       # income statement  (cols = dates, newest first)
-cashflow    = tk.cashflow         # cash flow statement
-balance     = tk.balance_sheet    # balance sheet
+print(f"\n  Fetching financial data for {TICKER} ...")
+print("  (Using browser-like session + retry on rate limits)\n")
+
+tk = fetch_ticker(TICKER)
+
+# Small delay between statement fetches to avoid burst rate-limits
+financials  = fetch_statement(tk, "financials");   time.sleep(0.5)
+cashflow    = fetch_statement(tk, "cashflow");     time.sleep(0.5)
+balance     = fetch_statement(tk, "balance_sheet"); time.sleep(0.5)
+info        = tk.info   # dict -- single call, no retry needed
 
 # -- Income statement rows ----------------------------------
 rev_row     = get_row(financials, "Total Revenue", "Revenue")
@@ -134,8 +221,6 @@ ni_row      = get_row(financials, "Net Income", "Net Income Common Stockholders"
 int_exp_row = get_row(financials, "Interest Expense",
                       "Interest Expense Non Operating",
                       "Net Interest Income")
-eps_row     = get_row(financials, "Diluted EPS", "Basic EPS",
-                      "Diluted Average Shares")
 
 # -- Cash flow rows -----------------------------------------
 da_row      = get_row(cashflow, "Depreciation And Amortization",
@@ -185,19 +270,21 @@ if _missing:
     print("  Available cashflow keys:", list(cashflow.index[:20]))
     print("  Available income stmt keys:", list(financials.index[:20]))
 
-# Mandatory check
 for name, row in [("Revenue", rev_row), ("EBIT", ebit_row),
-                  ("D&A", da_row),       ("CapEx", capex_row)]:
+                  ("D&A", da_row), ("CapEx", capex_row)]:
     if row is None:
-        raise ValueError(f"Could not fetch {name} for {TICKER}. "
-                         "Check ticker or yfinance availability.")
+        raise ValueError(
+            f"Could not fetch mandatory row '{name}' for {TICKER}.\n"
+            "  This may be a data availability issue with yfinance.\n"
+            "  Try a different ticker, or wait and retry."
+        )
 
 
 # -------------------------------------------------------------
-# 3. BUILD HISTORICAL DataFrame  (oldest -> newest)
+# 3. BUILD HISTORICAL DataFrame
 # -------------------------------------------------------------
-years    = sorted([d.year for d in rev_row.index])
-dates    = {yr: next(d for d in rev_row.index if d.year == yr) for yr in years}
+years  = sorted([d.year for d in rev_row.index])
+dates  = {yr: next(d for d in rev_row.index if d.year == yr) for yr in years}
 
 def hist_val(row, yr, abs_val=False):
     if row is None:
@@ -229,7 +316,6 @@ for yr in years:
 
 df = pd.DataFrame(rows).sort_values("Year").reset_index(drop=True)
 
-# -- Derived historical metrics ----------------------------
 df["NWC"]           = df["Current_Assets"] - df["Current_Liab"]
 df["DELTA_NWC"]     = df["NWC"].diff()
 df["EBIT_Margin"]   = df["EBIT"]   / df["Revenue"].replace(0, np.nan)
@@ -238,49 +324,37 @@ df["DA_pct"]        = df["D&A"]    / df["Revenue"].replace(0, np.nan)
 df["Capex_pct"]     = df["CAPEX"]  / df["Revenue"].replace(0, np.nan)
 df["NWC_pct"]       = df["NWC"]    / df["Revenue"].replace(0, np.nan)
 
-# Tax rate: Tax / Pretax  -- only when pretax > 0
 df["Tax_Rate"] = np.where(
     (df["Pretax_Income"] > 0) & df["Tax_Provision"].notna(),
     df["Tax_Provision"] / df["Pretax_Income"],
     np.nan
 )
 
-# Days metrics -- guard against NaN receivables/inventory/payables
 df["DSO"] = (df["Receivables"] / df["Revenue"].replace(0, np.nan)) * 365
 df["DIO"] = (df["Inventory"]   / df["Revenue"].replace(0, np.nan)) * 365
 df["DPO"] = (df["Payables"]    / df["Revenue"].replace(0, np.nan)) * 365
 
-# NOPAT-based FCFF
 df["NOPAT"] = df["EBIT"] * (1 - df["Tax_Rate"])
 df["FCFF"]  = df["NOPAT"] + df["D&A"] - df["CAPEX"] - df["DELTA_NWC"].fillna(0)
-
-# Revenue growth
 df["Rev_Growth"] = df["Revenue"].pct_change()
 
 
 # -------------------------------------------------------------
-# 4. DERIVE FORECAST ASSUMPTIONS  (institutional methodology)
+# 4. DERIVE FORECAST ASSUMPTIONS
 # -------------------------------------------------------------
+eff_tax  = trailing_avg(df["Tax_Rate"], 3)
+TAX_RATE = float(np.clip(eff_tax, 0.10, 0.35))
 
-# -- A. Effective Tax Rate  ->  3yr average (capped 10-35%) --
-eff_tax   = trailing_avg(df["Tax_Rate"], 3)
-TAX_RATE  = float(np.clip(eff_tax, 0.10, 0.35))
-
-# -- B. EBIT Margin  ->  expanding path ----------------------
-#    Professionals don't hold margin flat -- they model
-#    improvement as operating leverage / mix shift kicks in.
 margin_hist = trailing_avg(df["EBIT_Margin"], 3)
 margin_last = df["EBIT_Margin"].iloc[-1]
-margin_base = max(margin_hist, margin_last)          # start from better of two
+margin_base = max(margin_hist, margin_last)
 
-# Expand by 50bps/yr toward a ceiling of 35% (sell-side convention)
 EBIT_MARGINS = []
 m = margin_base
 for i in range(FORECAST_YEARS):
     m = min(m + 0.005, 0.35)
     EBIT_MARGINS.append(round(m, 4))
 
-# -- C. Revenue Growth  ->  analyst fwd + segment-aware taper -
 fwd_growth = info.get("revenueGrowth")
 if fwd_growth and 0.0 < fwd_growth < 0.60:
     base_g = fwd_growth
@@ -289,55 +363,46 @@ else:
     if np.isnan(base_g):
         base_g = 0.08
 
-# Taper toward (terminal_growth + 1pp) over the horizon
 floor_g = TERMINAL_GROWTH + 0.01
 REVENUE_GROWTH = []
 g = base_g
 for i in range(FORECAST_YEARS):
     REVENUE_GROWTH.append(round(max(g, floor_g), 4))
-    g *= 0.88        # ~12% deceleration per year (sell-side standard)
+    g *= 0.88
 
-# -- D. CapEx  ->  maintenance + growth split ----------------
-da_pct_hist     = trailing_avg(df["DA_pct"],    3)
-capex_pct_hist  = trailing_avg(df["Capex_pct"], 3)
+da_pct_hist    = trailing_avg(df["DA_pct"],    3)
+capex_pct_hist = trailing_avg(df["Capex_pct"], 3)
 
-# If CapEx % is NaN (row missing), fall back to D&A % + 5pp
 if np.isnan(capex_pct_hist):
     capex_pct_hist = da_pct_hist + 0.05 if not np.isnan(da_pct_hist) else 0.10
 if np.isnan(da_pct_hist):
-    da_pct_hist = trailing_avg(df["D&A"] / df["Revenue"].replace(0,np.nan), 3)
+    da_pct_hist = trailing_avg(df["D&A"] / df["Revenue"].replace(0, np.nan), 3)
 if np.isnan(da_pct_hist):
-    da_pct_hist = 0.07   # hard fallback
+    da_pct_hist = 0.07
 
 maint_capex_pct  = da_pct_hist
 growth_capex_pct = max(capex_pct_hist - maint_capex_pct, 0)
 
-# -- E. D&A  ->  PP&E roll-forward ---------------------------
 ppe_last = df["Net_PPE"].iloc[-1]
 if np.isnan(ppe_last):
-    # Estimate PPE from cumulative capex if not available
     ppe_last = df["CAPEX"].sum() * 0.5
 
 da_rate = trailing_avg(df["D&A"] / df["Net_PPE"].replace(0, np.nan), 3)
 if np.isnan(da_rate) or da_rate <= 0:
-    da_rate = da_pct_hist    # fallback: D&A % of revenue
+    da_rate = da_pct_hist
 
-# -- F. NWC  ->  days-based ----------------------------------
 dso_hist = trailing_avg(df["DSO"], 3)
 dio_hist = trailing_avg(df["DIO"], 3)
 dpo_hist = trailing_avg(df["DPO"], 3)
 
-# Hard fallbacks if days data not available (use sector medians)
 if np.isnan(dso_hist): dso_hist = 30.0
 if np.isnan(dio_hist): dio_hist = 45.0
 if np.isnan(dpo_hist): dpo_hist = 45.0
 
-# Professionals trend each metric slightly (efficiency gains)
-DSO_TREND = -0.5   # receivables collection improving 0.5 days/yr
-DIO_TREND = -0.3   # inventory turns improving
-DPO_TREND = +0.5   # payables stretching
+DSO_TREND = -0.5
+DIO_TREND = -0.3
+DPO_TREND = +0.5
 
-# -- G. Shares & Net Debt -----------------------------------
 shares_raw = (info.get("sharesOutstanding")
               or info.get("impliedSharesOutstanding") or 0)
 SHARES     = shares_raw / 1e9
@@ -347,33 +412,29 @@ if debt_row is not None and cash_b_row is not None:
 else:
     NET_DEBT = ((info.get("totalDebt") or 0) - (info.get("totalCash") or 0)) / 1e9
 
-# -- H. Market data for football field ---------------------
-current_price  = info.get("currentPrice") or info.get("regularMarketPrice") or np.nan
-week52_low     = info.get("fiftyTwoWeekLow")  or np.nan
-week52_high    = info.get("fiftyTwoWeekHigh") or np.nan
-fwd_pe         = info.get("forwardPE")        or np.nan
-trailing_pe    = info.get("trailingPE")        or np.nan
-ev_ebitda      = info.get("enterpriseToEbitda") or np.nan
-sector         = info.get("sector", "N/A")
-industry       = info.get("industry", "N/A")
-company_name   = info.get("longName", TICKER)
+current_price = info.get("currentPrice") or info.get("regularMarketPrice") or np.nan
+week52_low    = info.get("fiftyTwoWeekLow")  or np.nan
+week52_high   = info.get("fiftyTwoWeekHigh") or np.nan
+fwd_pe        = info.get("forwardPE")        or np.nan
+trailing_pe   = info.get("trailingPE")       or np.nan
+ev_ebitda     = info.get("enterpriseToEbitda") or np.nan
+sector        = info.get("sector",   "N/A")
+industry      = info.get("industry", "N/A")
+company_name  = info.get("longName", TICKER)
 
 
 # -------------------------------------------------------------
 # 5. FORECAST ENGINE
 # -------------------------------------------------------------
-last_rev   = df["Revenue"].iloc[-1]
-last_yr    = df["Year"].iloc[-1]
-ppe        = ppe_last if not np.isnan(ppe_last) else (last_rev * da_pct_hist / da_rate)
-prev_rev   = last_rev
+last_rev = df["Revenue"].iloc[-1]
+last_yr  = df["Year"].iloc[-1]
+ppe      = ppe_last if not np.isnan(ppe_last) else (last_rev * da_pct_hist / da_rate)
+prev_rev = last_rev
 
-# Initialise days
 dso = dso_hist
 dio = dio_hist
 dpo = dpo_hist
 
-# Last year receivables/inventory/payables for dNWC
-# Fall back to days-derived estimates if balance sheet data missing
 prev_rec = df["Receivables"].iloc[-1]
 prev_inv = df["Inventory"].iloc[-1]
 prev_pay = df["Payables"].iloc[-1]
@@ -382,22 +443,18 @@ if np.isnan(prev_inv): prev_inv = (dio_hist / 365) * last_rev
 if np.isnan(prev_pay): prev_pay = (dpo_hist / 365) * last_rev
 
 forecast_rows = []
-
 for i in range(FORECAST_YEARS):
     yr  = last_yr + i + 1
     rev = prev_rev * (1 + REVENUE_GROWTH[i])
 
-    # EBIT & NOPAT
     ebit  = rev * EBIT_MARGINS[i]
     nopat = ebit * (1 - TAX_RATE)
 
-    # D&A via PP&E roll-forward
-    capex      = rev * maint_capex_pct + (rev - prev_rev) * growth_capex_pct
-    da         = ppe * da_rate                     # depreciation on opening PP&E
-    ppe        = ppe + capex - da                  # closing PP&E  ->  next year opening
-    ebitda     = ebit + da
+    capex  = rev * maint_capex_pct + (rev - prev_rev) * growth_capex_pct
+    da     = ppe * da_rate
+    ppe    = ppe + capex - da
+    ebitda = ebit + da
 
-    # NWC via days-based approach
     dso = max(dso + DSO_TREND, 1)
     dio = max(dio + DIO_TREND, 0)
     dpo = max(dpo + DPO_TREND, 1)
@@ -407,25 +464,14 @@ for i in range(FORECAST_YEARS):
     pay = (dpo / 365) * rev
 
     delta_nwc = (rec - prev_rec) + (inv - prev_inv) - (pay - prev_pay)
-
-    # FCFF  (institutional formula -- NOPAT based)
-    fcff = nopat + da - capex - delta_nwc
+    fcff      = nopat + da - capex - delta_nwc
 
     forecast_rows.append({
-        "Year"       : yr,
-        "Revenue"    : rev,
-        "Rev_Growth" : REVENUE_GROWTH[i],
-        "EBIT"       : ebit,
-        "EBIT_Margin": EBIT_MARGINS[i],
-        "EBITDA"     : ebitda,
-        "D&A"        : da,
-        "CAPEX"      : capex,
-        "NOPAT"      : nopat,
-        "DELTA_NWC"  : delta_nwc,
-        "DSO"        : dso,
-        "DIO"        : dio,
-        "DPO"        : dpo,
-        "FCFF"       : fcff,
+        "Year": yr, "Revenue": rev, "Rev_Growth": REVENUE_GROWTH[i],
+        "EBIT": ebit, "EBIT_Margin": EBIT_MARGINS[i],
+        "EBITDA": ebitda, "D&A": da, "CAPEX": capex,
+        "NOPAT": nopat, "DELTA_NWC": delta_nwc,
+        "DSO": dso, "DIO": dio, "DPO": dpo, "FCFF": fcff,
     })
 
     prev_rev = rev
@@ -445,30 +491,24 @@ fc["PV_FCFF"]         = fc["FCFF"] * fc["Discount_Factor"]
 
 
 # -------------------------------------------------------------
-# 7. TERMINAL VALUE  (Gordon Growth Model)
+# 7. TERMINAL VALUE
 # -------------------------------------------------------------
-last_fcff      = fc["FCFF"].iloc[-1]
-TV             = (last_fcff * (1 + TERMINAL_GROWTH)) / (WACC - TERMINAL_GROWTH)
-PV_TV          = TV / (1 + WACC) ** fc["Year_Index"].iloc[-1]
-
-sum_pv_fcff    = fc["PV_FCFF"].sum()
-EV             = sum_pv_fcff + PV_TV
-EQUITY_VAL     = EV - NET_DEBT
-PRICE_TARGET   = EQUITY_VAL / SHARES
-
-# TV as % of EV  (sanity check -- ideally 60-80% for mature cos)
-TV_PCT         = PV_TV / EV * 100
+last_fcff   = fc["FCFF"].iloc[-1]
+TV          = (last_fcff * (1 + TERMINAL_GROWTH)) / (WACC - TERMINAL_GROWTH)
+PV_TV       = TV / (1 + WACC) ** fc["Year_Index"].iloc[-1]
+sum_pv_fcff = fc["PV_FCFF"].sum()
+EV          = sum_pv_fcff + PV_TV
+EQUITY_VAL  = EV - NET_DEBT
+PRICE_TARGET = EQUITY_VAL / SHARES
+TV_PCT      = PV_TV / EV * 100
 
 
 # -------------------------------------------------------------
-# 8. TRADING MULTIPLES  (for football field)
+# 8. TRADING MULTIPLES
 # -------------------------------------------------------------
-last_ebitda  = df["EBITDA"].iloc[-1]
 last_ni      = df["Net_Income"].iloc[-1]
 fwd_ebitda   = fc["EBITDA"].iloc[0]
-fwd_ni       = fc["NOPAT"].iloc[0] * (1 + 0)    # rough proxy
 
-# EV/EBITDA implied price  (use sector median multiple +-20%)
 ev_mult_low  = ev_ebitda * 0.80 if not np.isnan(ev_ebitda) else np.nan
 ev_mult_high = ev_ebitda * 1.20 if not np.isnan(ev_ebitda) else np.nan
 ev_low       = fwd_ebitda * ev_mult_low  if not np.isnan(ev_mult_low)  else np.nan
@@ -476,9 +516,8 @@ ev_high      = fwd_ebitda * ev_mult_high if not np.isnan(ev_mult_high) else np.n
 price_ev_low = (ev_low  - NET_DEBT) / SHARES if not np.isnan(ev_low)  else np.nan
 price_ev_hi  = (ev_high - NET_DEBT) / SHARES if not np.isnan(ev_high) else np.nan
 
-# P/E implied price
-pe_low       = fwd_pe * 0.85 * (last_ni / SHARES) if not np.isnan(fwd_pe) else np.nan
-pe_high      = fwd_pe * 1.15 * (last_ni / SHARES) if not np.isnan(fwd_pe) else np.nan
+pe_low  = fwd_pe * 0.85 * (last_ni / SHARES) if not np.isnan(fwd_pe) else np.nan
+pe_high = fwd_pe * 1.15 * (last_ni / SHARES) if not np.isnan(fwd_pe) else np.nan
 
 
 # -------------------------------------------------------------
@@ -519,7 +558,6 @@ print(f"  Sector: {sector}  |  Industry: {industry}")
 print(f"  Current Price: ${current_price:,.2f}  |  "
       f"52W Range: ${week52_low:,.2f} - ${week52_high:,.2f}")
 
-# -- KEY ASSUMPTIONS --------------------------------------
 print_section("KEY ASSUMPTIONS")
 print(f"  {'WACC':<35} {WACC:.2%}")
 print(f"  {'Terminal Growth Rate (= RFR)':<35} {TERMINAL_GROWTH:.2%}")
@@ -527,36 +565,27 @@ print(f"  {'Effective Tax Rate (3yr avg)':<35} {TAX_RATE:.2%}")
 print(f"  {'Shares Outstanding':<35} {SHARES:.3f}B")
 print(f"  {'Net Debt':<35} ${NET_DEBT:,.2f}B")
 print(f"  {'Base Revenue Growth (Yr 1)':<35} {REVENUE_GROWTH[0]:.2%}")
-rev_growth_str = [f"{x:.1%}" for x in REVENUE_GROWTH]
-print(f"  {'Revenue Growth Path':<35} {rev_growth_str}")
-ebit_margin_str = [f"{x:.1%}" for x in EBIT_MARGINS]
-print(f"  {'EBIT Margin Path':<35} {ebit_margin_str}")
+print(f"  {'Revenue Growth Path':<35} {[f'{x:.1%}' for x in REVENUE_GROWTH]}")
+print(f"  {'EBIT Margin Path':<35} {[f'{x:.1%}' for x in EBIT_MARGINS]}")
 print(f"  {'Maintenance CapEx % Rev':<35} {maint_capex_pct:.2%}")
 print(f"  {'Growth CapEx % Rev-Increment':<35} {growth_capex_pct:.2%}")
 print(f"  {'D&A Rate (on PP&E)':<35} {da_rate:.2%}")
 print(f"  {'DSO / DPO / DIO (base, days)':<35} {dso_hist:.1f} / {dpo_hist:.1f} / {dio_hist:.1f}")
 
-# -- HISTORICAL P&L + FCFF --------------------------------
 print_section("HISTORICAL FINANCIALS  (USD Billions)")
-hist_disp = df[["Year", "Revenue", "Rev_Growth", "EBIT", "EBIT_Margin",
-                 "EBITDA", "D&A", "CAPEX", "Tax_Rate",
-                 "NOPAT", "DELTA_NWC", "FCFF"]].copy()
-hist_disp["Rev_Growth"]  = hist_disp["Rev_Growth"].map(
-    lambda x: f"{x:.1%}" if not np.isnan(x) else "-")
-hist_disp["EBIT_Margin"] = hist_disp["EBIT_Margin"].map(
-    lambda x: f"{x:.1%}" if not np.isnan(x) else "-")
-hist_disp["Tax_Rate"]    = hist_disp["Tax_Rate"].map(
-    lambda x: f"{x:.1%}" if not np.isnan(x) else "-")
+hist_disp = df[["Year","Revenue","Rev_Growth","EBIT","EBIT_Margin",
+                 "EBITDA","D&A","CAPEX","Tax_Rate","NOPAT","DELTA_NWC","FCFF"]].copy()
+hist_disp["Rev_Growth"]  = hist_disp["Rev_Growth"].map(lambda x: f"{x:.1%}" if not np.isnan(x) else "-")
+hist_disp["EBIT_Margin"] = hist_disp["EBIT_Margin"].map(lambda x: f"{x:.1%}" if not np.isnan(x) else "-")
+hist_disp["Tax_Rate"]    = hist_disp["Tax_Rate"].map(lambda x: f"{x:.1%}" if not np.isnan(x) else "-")
 for col in ["Revenue","EBIT","EBITDA","D&A","CAPEX","NOPAT","DELTA_NWC","FCFF"]:
-    hist_disp[col] = hist_disp[col].map(
-        lambda x: f"{x:,.2f}" if not np.isnan(x) else "-")
+    hist_disp[col] = hist_disp[col].map(lambda x: f"{x:,.2f}" if not np.isnan(x) else "-")
 print(hist_disp.to_string(index=False))
 
-# -- FORECAST --------------------------------------------
 print_section("FORECAST  (USD Billions)")
-fc_disp = fc[["Year", "Revenue", "Rev_Growth", "EBIT", "EBIT_Margin",
-               "EBITDA", "D&A", "CAPEX", "NOPAT",
-               "DSO", "DIO", "DPO", "DELTA_NWC", "FCFF", "PV_FCFF"]].copy()
+fc_disp = fc[["Year","Revenue","Rev_Growth","EBIT","EBIT_Margin",
+               "EBITDA","D&A","CAPEX","NOPAT","DSO","DIO","DPO",
+               "DELTA_NWC","FCFF","PV_FCFF"]].copy()
 fc_disp["Rev_Growth"]  = fc_disp["Rev_Growth"].map(lambda x: f"{x:.1%}")
 fc_disp["EBIT_Margin"] = fc_disp["EBIT_Margin"].map(lambda x: f"{x:.1%}")
 fc_disp["DSO"]         = fc_disp["DSO"].map(lambda x: f"{x:.1f}")
@@ -566,7 +595,6 @@ for col in ["Revenue","EBIT","EBITDA","D&A","CAPEX","NOPAT","DELTA_NWC","FCFF","
     fc_disp[col] = fc_disp[col].map(lambda x: f"{x:,.2f}")
 print(fc_disp.to_string(index=False))
 
-# -- VALUATION BRIDGE ------------------------------------
 print_section("VALUATION BRIDGE  (USD Billions)")
 print(f"  {'PV of Forecast FCFFs':<40} ${sum_pv_fcff:>12,.2f}B")
 print(f"  {'PV of Terminal Value':<40} ${PV_TV:>12,.2f}B")
@@ -582,33 +610,27 @@ if not np.isnan(current_price):
     arrow  = "+" if updown >= 0 else "-"
     print(f"  {'   Implied Upside / Downside':<40} {arrow} {abs(updown):>10.1f}%")
 
-# -- FOOTBALL FIELD --------------------------------------
 print_section("FOOTBALL FIELD VALUATION SUMMARY  (Price per Share, USD)")
 rows_ff = []
 if not np.isnan(week52_low):
-    rows_ff.append(("52-Week Trading Range",
-                    f"${week52_low:,.2f}", f"${week52_high:,.2f}"))
+    rows_ff.append(("52-Week Trading Range", f"${week52_low:,.2f}", f"${week52_high:,.2f}"))
 if not np.isnan(price_ev_low):
     rows_ff.append((f"EV/EBITDA  ({ev_mult_low:.1f}x - {ev_mult_high:.1f}x)",
                     f"${price_ev_low:,.2f}", f"${price_ev_hi:,.2f}"))
 if not np.isnan(pe_low):
     rows_ff.append((f"P/E  ({fwd_pe*0.85:.1f}x - {fwd_pe*1.15:.1f}x fwd)",
                     f"${pe_low:,.2f}", f"${pe_high:,.2f}"))
-rows_ff.append(("DCF (Base Case)",
-                f"${PRICE_TARGET:,.2f}", f"${PRICE_TARGET:,.2f}"))
-
+rows_ff.append(("DCF (Base Case)", f"${PRICE_TARGET:,.2f}", f"${PRICE_TARGET:,.2f}"))
 print(f"\n  {'Methodology':<40} {'Low':>12}  {'High':>12}")
 print(f"  {'-'*66}")
 for label, lo, hi in rows_ff:
     print(f"  {label:<40} {lo:>12}  {hi:>12}")
 
-# -- SENSITIVITY -----------------------------------------
 print_section(f"SENSITIVITY ANALYSIS  --  Price per Share")
 print(f"  Base Case: WACC = {WACC:.2%}  |  Terminal Growth = {TERMINAL_GROWTH:.2%}\n")
 print(f"  Rows = Terminal Growth Rate  |  Columns = WACC\n")
 print(sens.to_string())
 
-# -- SANITY CHECKS ---------------------------------------
 print_section("MODEL SANITY CHECKS")
 checks = {
     "TV % of EV  (target: 50-80%)"       : f"{TV_PCT:.1f}%   {'OK' if 40 < TV_PCT < 85 else 'review'}",
