@@ -1,17 +1,18 @@
 """
 ================================================================================
   INSTITUTIONAL-GRADE DCF MODEL  |  JPMorgan Equity Research Style
+  Data Source: yfinance (no API key required)
 ================================================================================
 """
 
 import warnings
 warnings.filterwarnings("ignore")
 
-import os
-import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
+import requests
 import streamlit as st
+import yfinance as yf
 
 pd.set_option("display.max_rows", None)
 pd.set_option("display.max_columns", None)
@@ -24,59 +25,120 @@ pd.set_option("display.float_format", lambda x: f"{x:,.2f}")
 TICKER         = "GOOG"
 WACC           = 0.112
 FORECAST_YEARS = 5
-
-FMP_API_KEY = st.secrets["FMP_API_KEY"]
 # ============================================================
 
 
 # -------------------------------------------------------------
-# FMP API HELPERS
+# YFINANCE API HELPERS
 # -------------------------------------------------------------
-FMP_BASE = "https://financialmodelingprep.com/api/v4"
-
-def fmp_get(endpoint, params=None):
-    p = {"apikey": FMP_API_KEY}
-    if params:
-        p.update(params)
-    r = requests.get(f"{FMP_BASE}/{endpoint}", params=p, timeout=15)
-    if not r.ok:
-        st.error(f"FMP API error {r.status_code} on /{endpoint}: {r.text[:500]}")
-        raise ValueError(f"HTTP {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    if isinstance(data, dict) and "Error Message" in data:
-        st.error(f"FMP error: {data['Error Message']}")
-        raise ValueError(f"FMP API error: {data['Error Message']}")
-    return data
 
 def fmp_income(ticker, limit=4):
-    data = fmp_get("income-statement", {"symbol": ticker, "limit": limit, "period": "annual"})
-    return data.get("financials", data) if isinstance(data, dict) else data
+    t = yf.Ticker(ticker)
+    inc = t.financials  # rows=line items, cols=dates
+    if inc is None or inc.empty:
+        return []
+    inc = inc.T.sort_index().tail(limit)
+    rows = []
+    for date, row in inc.iterrows():
+        ebitda_val = row.get("EBITDA", np.nan)
+        op_income  = row.get("Operating Income", np.nan)
+        da_val     = row.get("Reconciled Depreciation", row.get("Depreciation And Amortization", np.nan))
+        # Fallback: EBIT + D&A
+        if pd.isna(ebitda_val) and not pd.isna(op_income) and not pd.isna(da_val):
+            ebitda_val = op_income + da_val
+        rows.append({
+            "calendarYear"     : str(date.year),
+            "revenue"          : row.get("Total Revenue", np.nan),
+            "operatingIncome"  : op_income,
+            "ebitda"           : ebitda_val,
+            "netIncome"        : row.get("Net Income", np.nan),
+            "incomeTaxExpense" : row.get("Tax Provision", np.nan),
+            "incomeBeforeTax"  : row.get("Pretax Income", np.nan),
+            "interestExpense"  : row.get("Interest Expense", np.nan),
+        })
+    return rows
+
 
 def fmp_cashflow(ticker, limit=4):
-    data = fmp_get("cash-flow-statement", {"symbol": ticker, "limit": limit, "period": "annual"})
-    return data.get("financials", data) if isinstance(data, dict) else data
+    t = yf.Ticker(ticker)
+    cf = t.cashflow
+    if cf is None or cf.empty:
+        return []
+    cf = cf.T.sort_index().tail(limit)
+    rows = []
+    for date, row in cf.iterrows():
+        da_val = row.get(
+            "Depreciation And Amortization",
+            row.get("Reconciled Depreciation", np.nan)
+        )
+        rows.append({
+            "calendarYear"                : str(date.year),
+            "depreciationAndAmortization" : da_val,
+            "capitalExpenditure"          : row.get("Capital Expenditure", np.nan),
+            "operatingCashFlow"           : row.get("Operating Cash Flow", np.nan),
+        })
+    return rows
+
 
 def fmp_balance(ticker, limit=4):
-    data = fmp_get("balance-sheet-statement", {"symbol": ticker, "limit": limit, "period": "annual"})
-    return data.get("financials", data) if isinstance(data, dict) else data
+    t = yf.Ticker(ticker)
+    bal = t.balance_sheet
+    if bal is None or bal.empty:
+        return []
+    bal = bal.T.sort_index().tail(limit)
+    rows = []
+    for date, row in bal.iterrows():
+        cash = row.get("Cash And Cash Equivalents",
+               row.get("Cash Cash Equivalents And Short Term Investments", np.nan))
+        rows.append({
+            "calendarYear"              : str(date.year),
+            "netReceivables"            : row.get("Net Receivables",
+                                          row.get("Accounts Receivable", np.nan)),
+            "inventory"                 : row.get("Inventory", np.nan),
+            "accountPayables"           : row.get("Accounts Payable", np.nan),
+            "propertyPlantEquipmentNet" : row.get("Net PPE", np.nan),
+            "totalCurrentAssets"        : row.get("Current Assets", np.nan),
+            "totalCurrentLiabilities"   : row.get("Current Liabilities", np.nan),
+            "totalDebt"                 : row.get("Total Debt", np.nan),
+            "cashAndCashEquivalents"    : cash,
+        })
+    return rows
+
 
 def fmp_profile(ticker):
-    data = fmp_get("company/profile", {"symbol": ticker})
-    if isinstance(data, dict):
-        return data.get("profile", data)
-    return data[0] if data else {}
+    info = yf.Ticker(ticker).info
+    return {
+        "companyName"   : info.get("longName", ticker),
+        "sector"        : info.get("sector",   "N/A"),
+        "industry"      : info.get("industry", "N/A"),
+        "revenueGrowth" : info.get("revenueGrowth", np.nan),
+    }
+
 
 def fmp_quote(ticker):
-    data = fmp_get("quote", {"symbol": ticker})
-    return data[0] if isinstance(data, list) and data else {}
+    info = yf.Ticker(ticker).info
+    return {
+        "price"             : info.get("currentPrice") or info.get("regularMarketPrice", np.nan),
+        "yearLow"           : info.get("fiftyTwoWeekLow",  np.nan),
+        "yearHigh"          : info.get("fiftyTwoWeekHigh", np.nan),
+        "sharesOutstanding" : info.get("sharesOutstanding", np.nan),
+        "marketCap"         : info.get("marketCap", np.nan),
+    }
+
 
 def fmp_ratios(ticker):
-    data = fmp_get("ratios-ttm", {"symbol": ticker})
-    return data[0] if isinstance(data, list) and data else {}
+    info = yf.Ticker(ticker).info
+    return {
+        "peRatioTTM" : info.get("trailingPE") or info.get("forwardPE", np.nan),
+    }
+
 
 def fmp_key_metrics(ticker):
-    data = fmp_get("key-metrics-ttm", {"symbol": ticker})
-    return data[0] if isinstance(data, list) and data else {}
+    info = yf.Ticker(ticker).info
+    return {
+        "evToEbitdaTTM" : info.get("enterpriseToEbitda", np.nan),
+    }
+
 
 def fetch_treasury_rate():
     try:
@@ -139,9 +201,9 @@ print(f"  10Y Treasury : {RISK_FREE_RATE:.2%}  (used as terminal growth rate)")
 
 
 # -------------------------------------------------------------
-# 2. FETCH RAW DATA FROM FMP
+# 2. FETCH RAW DATA FROM YFINANCE
 # -------------------------------------------------------------
-print(f"\n  Fetching FMP data for {TICKER}...")
+print(f"\n  Fetching yfinance data for {TICKER}...")
 
 inc_raw  = fmp_income(TICKER)
 cf_raw   = fmp_cashflow(TICKER)
@@ -154,7 +216,7 @@ metrics  = fmp_key_metrics(TICKER)
 if not inc_raw:
     raise ValueError(
         f"No income statement data for {TICKER}. "
-        "Check your FMP_API_KEY and that the ticker is valid."
+        "Check that the ticker is valid and yfinance can reach Yahoo Finance."
     )
 
 inc_raw  = list(reversed(inc_raw))
@@ -203,6 +265,10 @@ for yr in common_yrs:
     cur_liab      = safe(b.get("totalCurrentLiabilities"))
     total_debt    = safe(b.get("totalDebt"))
     cash          = safe(b.get("cashAndCashEquivalents"))
+
+    # Fallback: if EBITDA still NaN, derive it
+    if np.isnan(ebitda) and not np.isnan(ebit) and not np.isnan(da):
+        ebitda = ebit + da
 
     rows.append({
         "Year"             : int(yr),
@@ -269,7 +335,7 @@ NET_DEBT       = (safe(latest_bal.get("totalDebt", 0)) -
 SHARES         = shares_out if shares_out > 0 else market_cap / current_price
 
 fwd_pe         = safe(ratios.get("peRatioTTM"))
-ev_ebitda_mult = safe(metrics.get("evToEbitdaTTM") or ratios.get("enterpriseValueMultipleTTM"))
+ev_ebitda_mult = safe(metrics.get("evToEbitdaTTM"))
 rev_growth_fwd = safe(profile.get("revenueGrowth"))
 
 if np.isnan(rev_growth_fwd) or not (0.0 < rev_growth_fwd < 0.60):
@@ -422,7 +488,7 @@ print(f"  Current Price: ${current_price:,.2f}  |  52W Range: ${week52_low:,.2f}
 
 print_section("KEY ASSUMPTIONS")
 for label, val in [
-    ("WACC",                        f"{WACC:.2%}"),
+    ("WACC",                         f"{WACC:.2%}"),
     ("Terminal Growth Rate (= RFR)", f"{TERMINAL_GROWTH:.2%}"),
     ("Effective Tax Rate (3yr avg)", f"{TAX_RATE:.2%}"),
     ("Shares Outstanding",           f"{SHARES:.3f}B"),
@@ -500,7 +566,7 @@ for label, val in [
     print(f"  {label:<45} {val}")
 
 print("\n" + "-"*90)
-print("  Data source: Financial Modeling Prep API  |  financialmodelingprep.com")
+print("  Data source: Yahoo Finance via yfinance")
 print("  Model complete. Values in USD billions unless stated.")
 print("  For analytical purposes only — not investment advice.")
 print("-"*90 + "\n")
